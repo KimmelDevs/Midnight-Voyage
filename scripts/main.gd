@@ -1,22 +1,21 @@
 extends Node2D
-## Isometric café: customers arrive and order; chefs cook, baristas brew,
-## waiters serve, hostesses greet, cleaners wash dishes. Dishes earn star tiers.
-## Days: open -> closing -> night. At night the layout can be edited and
-## furniture bought in the shop placed and rotated.
+## The Sky Café airship. The café map is the ship's deck, built tile by tile
+## from GS.ship: an indoor cabin (kitchen) at the stern and an open deck with
+## railings, over a hull drawn from the deck outline. Customers come aboard by
+## the gangway; chefs cook, baristas brew, waiters serve, hostesses greet,
+## cleaners wash dishes. Days: open -> closing -> night (edit furniture).
 
 const HW := 29            # half tile width (px)
 const HH := 18            # half tile height (px)
 const TILE_ANCHOR := Vector2(29, 18)  # diamond centre inside the floor tile image
-const COLS := 7
-const ROWS := 6
-const ORIGIN := Vector2(330, 92)   # top vertex of tile (0,0)
+const ORIGIN := Vector2(240, 70)   # top vertex of deck tile (0,0)
 const WALL_H := 74
+const HULL_DEPTH := 78.0           # hull height under the middle of the ship
 
-const DOOR := Vector2i(6, 0)
 const REST_SPOT := Vector2i(1, 5)
 const IDLE_SPOTS := {
-	"Chef": Vector2i(1, 2), "Barista": Vector2i(2, 2), "Waiter": Vector2i(2, 3),
-	"Hostess": Vector2i(6, 1), "Cleaner": Vector2i(2, 5), "Rest": REST_SPOT,
+	"Chef": Vector2i(1, 1), "Barista": Vector2i(1, 2), "Waiter": Vector2i(4, 4),
+	"Hostess": Vector2i(6, 4), "Cleaner": Vector2i(2, 4), "Rest": REST_SPOT,
 }
 ## rot 0..3: facing SE, SW, NW, NE (+c, +r, -c, -r). 0/1 use the front art
 ## (1 mirrored); 2/3 use the <item>_back art when it exists.
@@ -31,7 +30,16 @@ const RARITY_COL := {"R": Color("aab4c4"), "SR": Color("b07ce8"), "SSR": Color("
 const NIGHT_TINT := Color(0.55, 0.56, 0.82)
 const SEAT_SLIDE := 0.35   # fraction of the chair->table step a seated customer moves in
 
+# ship geometry (from GS.ship)
+var COLS := 1
+var ROWS := 1
+var DOOR := Vector2i.ZERO          # gangway tile
+var deck := {}                     # Vector2i -> true
+var cabin := Rect2i()
+
 var astar := AStarGrid2D.new()
+var ship_root: Node2D
+var camera: Camera2D
 var world: Node2D
 var rug_layer: Node2D
 var fx: Node2D
@@ -67,8 +75,10 @@ var working := {}               # key -> bool (doing a task)
 var dirty_dishes := 0           # plates waiting at the sink
 var spawn_t := 3.0
 var save_t := 0.0
+var bob_t := 0.0
 var customer_sheets: Array[Texture2D] = []
 var theme_ui: Theme
+var kit := {}                   # ship-kit piece anchors (assets/ship/kit.json)
 
 # day cycle: "open" -> "closing" -> "night"
 var phase := "open"
@@ -91,29 +101,40 @@ var hover := Vector2i(-1, -1)
 # ------------------------------------------------------------------ setup
 func _ready() -> void:
 	randomize()
+	_load_ship()
 	tint = CanvasModulate.new()
 	add_child(tint)
-	_build_background()
-	_build_floor()
+	var sky := CanvasLayer.new()
+	sky.layer = -1
+	add_child(sky)
+	sky.add_child(BgNode.new())
+	sky.add_child(CloudNode.new())
+	ship_root = Node2D.new()
+	add_child(ship_root)
+	camera = Camera2D.new()
+	camera.position = _ship_center() + Vector2(-60, -95)
+	add_child(camera)
+	_build_ship()
 	rug_layer = Node2D.new()
 	rug_layer.z_index = -9
-	add_child(rug_layer)
+	ship_root.add_child(rug_layer)
 	world = Node2D.new()
 	world.y_sort_enabled = true
-	add_child(world)
+	ship_root.add_child(world)
+	_build_front_rails()
 	fx = Node2D.new()
 	fx.z_index = 50
-	add_child(fx)
+	ship_root.add_child(fx)
 	grid_node = GridNode.new()
 	grid_node.main = self
 	grid_node.z_index = -8
 	grid_node.visible = false
-	add_child(grid_node)
+	ship_root.add_child(grid_node)
 	ghost = Sprite2D.new()
 	ghost.centered = false
 	ghost.z_index = 60
 	ghost.visible = false
-	add_child(ghost)
+	ship_root.add_child(ghost)
 	astar.region = Rect2i(0, 0, COLS, ROWS)
 	astar.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
 	astar.update()
@@ -124,7 +145,7 @@ func _ready() -> void:
 		_spawn_staff(key)
 	GS.changed.connect(_refresh_hud)
 	_refresh_hud()
-	_toast("Day %d - the café is open!" % GS.day)
+	_toast("Day %d - the Sky Café is open!" % GS.day)
 	var args := OS.get_cmdline_user_args()
 	# `godot -- --demo-staff` / `--demo-menu` / `--demo-night` / `--demo-shop` (screenshots/tests)
 	if "--demo-night" in args:
@@ -176,6 +197,10 @@ func _ready() -> void:
 	if "--demo-shop" in args:
 		await get_tree().create_timer(1.0).timeout
 		_open_shop()
+	if "--demo-pan" in args:  # glide the camera along the ship
+		var tw := create_tween()
+		tw.tween_property(camera, "position", camera.position + Vector2(160, 60), 3.0)
+		tw.tween_property(camera, "position", camera.position + Vector2(-140, -40), 3.0)
 	# `godot -- --demo-summon` showcases a 10-pull (used for screenshots/tests)
 	if "--demo-summon" in args:
 		await get_tree().create_timer(1.0).timeout
@@ -200,27 +225,174 @@ func pos_tile(p: Vector2) -> Vector2i:
 	return Vector2i(roundi((a + b) / 2.0), roundi((b - a) / 2.0))
 
 
+## Tile under the mouse (the ship bobs, so use its local space).
+func mouse_tile() -> Vector2i:
+	return pos_tile(ship_root.get_local_mouse_position())
+
+
 func in_room(t: Vector2i) -> bool:
-	return t.x >= 0 and t.y >= 0 and t.x < COLS and t.y < ROWS
+	return deck.has(t)
 
 
-func _build_background() -> void:
-	var bg := BgNode.new()
-	bg.z_index = -20
-	add_child(bg)
-	var walls := WallNode.new()
-	walls.z_index = -15
-	walls.origin = ORIGIN
-	walls.cols = COLS
-	walls.rows = ROWS
-	walls.hw = HW
-	walls.hh = HH
-	walls.wall_h = WALL_H
-	add_child(walls)
-	# wall decorations, sheared to sit flat on the 2:1 walls
-	_wall_decor("res://assets/cafe/wall_left.png", 3.0, true)
-	_wall_decor("res://assets/cafe/wall_right.png", 2.4, false)
-	_wall_decor("res://assets/cafe/door.png", 6.3, false)
+# ------------------------------------------------------------------ the ship
+func _load_ship() -> void:
+	var rows: Array = GS.ship["deck"]
+	ROWS = rows.size()
+	COLS = 0
+	for r in rows.size():
+		var line: String = rows[r]
+		COLS = maxi(COLS, line.length())
+		for c in line.length():
+			if line[c] == "X":
+				deck[Vector2i(c, r)] = true
+	var cb: Array = GS.ship["cabin"]
+	cabin = Rect2i(int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3]))
+	DOOR = Vector2i(int(GS.ship["gangway"][0]), int(GS.ship["gangway"][1]))
+
+
+func in_cabin(t: Vector2i) -> bool:
+	return cabin.has_point(t)
+
+
+func _ship_center() -> Vector2:
+	return tile_pos(Vector2i(COLS / 2, ROWS / 2)) + Vector2(0, 30)
+
+
+## Deck tiles in back-to-front order (so floor tiles overlap correctly).
+func _deck_tiles_sorted() -> Array:
+	var out: Array = deck.keys()
+	out.sort_custom(func(a, b): return a.x + a.y < b.x + b.y or (a.x + a.y == b.x + b.y and a.x < b.x))
+	return out
+
+
+func _build_ship() -> void:
+	var f := FileAccess.open("res://assets/ship/kit.json", FileAccess.READ)
+	if f:
+		kit = JSON.parse_string(f.get_as_text())
+	var C := COLS
+	var R := ROWS
+	var v := func(c: int, r: int, corner: String) -> Vector2:
+		var p := tile_pos(Vector2i(c, r))
+		match corner:
+			"top": return p + Vector2(0, -HH)
+			"right": return p + Vector2(HW, 0)
+			"bottom": return p + Vector2(0, HH)
+		return p + Vector2(-HW, 0)
+	# hull: the long side (lower-left faces) in 2-tile sections, portholes alternating
+	for c in range(0, C - 1, 2):
+		var piece := "hull_port" if (c / 2) % 2 == 1 else "hull_a"
+		_kit_edge(piece, "top", v.call(c, R - 1, "left"), v.call(c + 1, R - 1, "bottom"), -12)
+	# hull: the bow end (lower-right faces), mirrored sections
+	for r in range(0, R - 1, 2):
+		var piece := "hull_port" if (r / 2) % 2 == 1 else "hull_a"
+		_kit_edge(piece, "top", v.call(C - 1, r, "right"), v.call(C - 1, r + 1, "bottom"), -12)
+	# lower belly row, a little shorter at each end, so the hull curves under the deck
+	var drop := Vector2(0, 27)
+	for c in range(2, C - 3, 2):
+		_kit_edge("hull_b" if (c / 2) % 2 == 0 else "hull_port_b", "top", v.call(c, R - 1, "left") + drop,
+			v.call(c + 1, R - 1, "bottom") + drop, -13)
+	for r in range(2, R - 3, 2):
+		_kit_edge("hull_b", "top", v.call(C - 1, r, "right") + drop, v.call(C - 1, r + 1, "bottom") + drop, -13)
+	_kit_at("bow", v.call(C - 1, R - 1, "bottom") + Vector2(0, -8), -11, Vector2(0.5, 0.0))
+	_kit_at("stern", v.call(0, R - 1, "left") + Vector2(-6, -6), -11, Vector2(0.5, 0.0))
+	_kit_at("propeller", v.call(0, R - 1, "left") + Vector2(-24, 40), -11, Vector2(0.5, 0.5), true)
+	_kit_at("propeller", v.call(C - 1, 0, "right") + Vector2(18, 40), -11, Vector2(0.5, 0.5))
+	# cabin back walls with arched windows
+	for c in range(cabin.position.x, cabin.end.x - 1, 2):
+		_kit_edge("wall_window_a", "bottom", v.call(c, cabin.position.y, "top"),
+			v.call(c + 1, cabin.position.y, "right"), -15)
+	for r in range(cabin.position.y, cabin.end.y - 1, 2):
+		_kit_edge("wall_window_b", "bottom", v.call(cabin.position.x, r + 1, "left"),
+			v.call(cabin.position.x, r, "top"), -15)
+	var corner: Vector2 = v.call(cabin.position.x, cabin.position.y, "top")
+	_kit_at("dome", corner + Vector2(0, -74), -14, Vector2(0.5, 1.0))
+	_kit_at("awning", v.call(cabin.end.x - 1, cabin.position.y, "right") + Vector2(-8, -40), -13, Vector2(0.5, 0.5))
+	# back railings beyond the cabin
+	for c in range(cabin.end.x, C - 1, 2):
+		_kit_edge("rail_a", "bottom", v.call(c, 0, "top"), v.call(c + 1, 0, "right"), -11)
+	for r in range(cabin.end.y, R - 1, 2):
+		_kit_edge("rail_a", "bottom", v.call(0, r, "top"), v.call(0, r + 1, "left"), -11)
+	# deck floor: cabin checker inside, planks outside
+	var wood := tex("res://assets/cafe/floor_wood.png")
+	var check := tex("res://assets/cafe/floor_check.png")
+	for t in _deck_tiles_sorted():
+		var s := Sprite2D.new()
+		s.texture = check if in_cabin(t) else wood
+		s.centered = false
+		s.position = tile_pos(t) - TILE_ANCHOR
+		s.z_index = -10
+		ship_root.add_child(s)
+
+
+## Front railings, lantern posts and the gangway are y-sorted with the
+## furniture so they pass in front of whatever stands behind them.
+func _build_front_rails() -> void:
+	var C := COLS
+	var R := ROWS
+	for c in range(0, C - 1, 2):
+		if DOOR.y == R - 1 and (DOOR.x == c or DOOR.x == c + 1):
+			continue  # gap for the gangway
+		var a := tile_pos(Vector2i(c, R - 1)) + Vector2(-HW, 0)
+		var b := tile_pos(Vector2i(c + 1, R - 1)) + Vector2(0, HH)
+		_kit_edge("rail_a", "bottom", a, b, 0, true)
+	for r in range(0, R - 1, 2):
+		var a := tile_pos(Vector2i(C - 1, r)) + Vector2(HW, 0)
+		var b := tile_pos(Vector2i(C - 1, r + 1)) + Vector2(0, HH)
+		_kit_edge("rail_a", "bottom", a, b, 0, true)
+	for corner in [tile_pos(Vector2i(0, R - 1)) + Vector2(-HW, 0), tile_pos(Vector2i(C - 1, R - 1)) + Vector2(0, HH),
+			tile_pos(Vector2i(C - 1, 0)) + Vector2(HW, 0)]:
+		_kit_at("post", corner + Vector2(0, 2), 0, Vector2(0.5, 1.0), false, true)
+	var gate := tile_pos(DOOR) + Vector2(-HW / 2.0, HH / 2.0)
+	_kit_at("post", gate + Vector2(-16, -8), 0, Vector2(0.5, 1.0), false, true)
+	_kit_at("post", gate + Vector2(14, 10), 0, Vector2(0.5, 1.0), false, true)
+	_kit_at("gangway", gate + Vector2(-22, 22), 0, Vector2(0.5, 0.5), true, true)
+
+
+## Lay a kit piece along a tile edge: its anchor line (top or bottom edge of
+## the art, from kit.json) is stretched/sheared onto a -> b. When a is the
+## right-hand end the piece comes out mirrored (other side of the ship).
+func _kit_edge(piece: String, edge: String, a: Vector2, b: Vector2, z: int, sorted := false) -> void:
+	var t := tex("res://assets/ship/%s.png" % piece)
+	if t == null or not kit.has(piece):
+		return
+	var m: Array = kit[piece][edge]
+	var s := Vector2(m[0][0], m[0][1])
+	var e := Vector2(m[1][0], m[1][1])
+	var sx := (b.x - a.x) / (e.x - s.x)
+	var k := (b.y - a.y - (e.y - s.y)) / (e.x - s.x)
+	var spr := Sprite2D.new()
+	spr.texture = t
+	spr.centered = false
+	var origin := a - Vector2(sx * s.x, s.y + k * s.x)
+	if sorted:  # y-sort by the edge's middle
+		var holder := Node2D.new()
+		holder.position = ((a + b) / 2.0 + Vector2(0, 2)).round()
+		spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), origin - holder.position)
+		holder.add_child(spr)
+		world.add_child(holder)
+	else:
+		spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), origin)
+		spr.z_index = z
+		ship_root.add_child(spr)
+
+
+## Place a kit piece with its pivot (fractions of its size) at a point.
+func _kit_at(piece: String, at: Vector2, z: int, pivot: Vector2, flip := false, sorted := false) -> void:
+	var t := tex("res://assets/ship/%s.png" % piece)
+	if t == null:
+		return
+	var spr := Sprite2D.new()
+	spr.texture = t
+	spr.centered = false
+	spr.flip_h = flip
+	spr.offset = (-t.get_size() * pivot).round()
+	if sorted:
+		spr.position = at.round()
+		world.add_child(spr)
+	else:
+		spr.position = at.round()
+		spr.z_index = z
+		ship_root.add_child(spr)
 
 
 func _wall_decor(path: String, t: float, left_wall: bool) -> void:
@@ -232,31 +404,16 @@ func _wall_decor(path: String, t: float, left_wall: bool) -> void:
 	s.centered = false
 	s.offset = Vector2(-tx.get_width() / 2.0, -tx.get_height()).floor()
 	var k := float(HH) / HW - 0.375
+	var o := tile_pos(cabin.position) - Vector2(0, HH)
 	var base: Vector2
 	if left_wall:
-		base = ORIGIN + Vector2(-t * HW, t * HH)
+		base = o + Vector2(-t * HW, t * HH)
 		s.transform = Transform2D(Vector2(-1, k), Vector2(0, 1), base + Vector2(0, -2))
 	else:
-		base = ORIGIN + Vector2(t * HW, t * HH)
+		base = o + Vector2(t * HW, t * HH)
 		s.transform = Transform2D(Vector2(1, k), Vector2(0, 1), base + Vector2(0, -2))
 	s.z_index = -14
-	add_child(s)
-
-
-func _build_floor() -> void:
-	var wood := tex("res://assets/cafe/floor_wood.png")
-	var check := tex("res://assets/cafe/floor_check.png")
-	for sum in range(COLS + ROWS - 1):
-		for c in COLS:
-			var r := sum - c
-			if r < 0 or r >= ROWS:
-				continue
-			var s := Sprite2D.new()
-			s.texture = check if c <= 1 else wood
-			s.centered = false
-			s.position = tile_pos(Vector2i(c, r)) - TILE_ANCHOR
-			s.z_index = -10
-			add_child(s)
+	ship_root.add_child(s)
 
 
 # ------------------------------------------------------------------ layout
@@ -302,6 +459,10 @@ func _apply_layout() -> void:
 	rug_at.clear()
 	stations.clear()
 	astar.fill_solid_region(astar.region, false)
+	for c in COLS:
+		for r in ROWS:
+			if not deck.has(Vector2i(c, r)):
+				astar.set_point_solid(Vector2i(c, r), true)  # open sky
 	for i in GS.placed.size():
 		var p: Dictionary = GS.placed[i]
 		var t := Vector2i(p["c"], p["r"])
@@ -380,15 +541,13 @@ func free_spot(want: Vector2i) -> Vector2i:
 		return want
 	var best := want
 	var best_d := 1 << 30
-	for c in COLS:
-		for r in ROWS:
-			var t := Vector2i(c, r)
-			if astar.is_point_solid(t) or t == DOOR:
-				continue
-			var d: int = absi(c - want.x) + absi(r - want.y)
-			if d < best_d:
-				best_d = d
-				best = t
+	for t in deck:
+		if astar.is_point_solid(t) or t == DOOR:
+			continue
+		var d: int = absi(t.x - want.x) + absi(t.y - want.y)
+		if d < best_d:
+			best_d = d
+			best = t
 	return best
 
 
@@ -932,6 +1091,13 @@ func _pay(c: Dictionary, food: String, tier: String) -> void:
 
 # ------------------------------------------------------------------ day cycle
 func _process(delta: float) -> void:
+	bob_t += delta
+	ship_root.position.y = round(sin(bob_t * 1.3) * 1.5)
+	var pan := Vector2(
+		float(Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT)) - float(Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT)),
+		float(Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN)) - float(Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP)))
+	if pan != Vector2.ZERO and not overlay.visible:
+		_move_camera(pan * 220.0 * delta)
 	match phase:
 		"open":
 			day_t += delta
@@ -1943,17 +2109,29 @@ func _update_ghost() -> void:
 	ghost.modulate = Color(0.6, 1, 0.6, 0.8) if _can_place(hover) else Color(1, 0.5, 0.5, 0.7)
 
 
+## Pan around the ship: drag with the middle mouse button (or left/right
+## drag when not editing), or WASD / arrow keys.
+func _move_camera(d: Vector2) -> void:
+	var c := _ship_center()
+	camera.position = (camera.position + d).clamp(c - Vector2(230, 170), c + Vector2(230, 90)).round()
+
+
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion and not overlay.visible:
+		var m: int = event.button_mask
+		if m & MOUSE_BUTTON_MASK_MIDDLE or (not editing and m & (MOUSE_BUTTON_MASK_LEFT | MOUSE_BUTTON_MASK_RIGHT)):
+			_move_camera(-event.relative)
+			return
 	if not editing or overlay.visible:
 		return
 	if event is InputEventMouseMotion:
-		var t := pos_tile(get_global_mouse_position())
+		var t := mouse_tile()
 		if t != hover:
 			hover = t
 			grid_node.queue_redraw()
 			_update_ghost()
 	elif event is InputEventMouseButton and event.pressed:
-		var t := pos_tile(get_global_mouse_position())
+		var t := mouse_tile()
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			if held.is_empty():
 				_pick_up(t)
@@ -1996,40 +2174,13 @@ class BgNode extends Node2D:
 				draw_circle(c + Vector2(j * 18 - 27, rng.randi_range(-6, 6)), r, Color("7a5c95"))
 
 
-class WallNode extends Node2D:
-	var origin: Vector2
-	var cols: int
-	var rows: int
-	var hw: int
-	var hh: int
-	var wall_h: int
-
-	func _draw() -> void:
-		var t := origin
-		var r := origin + Vector2(cols * hw, cols * hh)
-		var l := origin + Vector2(-rows * hw, rows * hh)
-		var up := Vector2(0, -wall_h)
-		var wain := Vector2(0, -22)
-		_wall(l, t, up, wain, Color("e9cdbb"), Color("8c5a3a"), Color("a56c46"))
-		_wall(t, r, up, wain, Color("f6dccb"), Color("9c6542"), Color("b77b52"))
-		draw_line(t, t + up, Color("6b4630"), 2)
-
-	func _wall(a: Vector2, b: Vector2, up: Vector2, wain: Vector2, plaster: Color, wood_dk: Color, wood: Color) -> void:
-		draw_colored_polygon(PackedVector2Array([a, b, b + up, a + up]), plaster)
-		draw_colored_polygon(PackedVector2Array([a, b, b + wain, a + wain]), wood)
-		draw_line(a + wain, b + wain, wood_dk, 2)
-		draw_line(a + up, b + up, Color("6b4630"), 3)
-		draw_line(a + up + Vector2(0, 3), b + up + Vector2(0, 3), Color("c99572"), 1)
-
-
 ## Tile outlines shown while editing; the hovered tile is highlighted.
 class GridNode extends Node2D:
 	var main: Node2D
 
 	func _draw() -> void:
-		for c in main.COLS:
-			for r in main.ROWS:
-				var t := Vector2i(c, r)
+		for t in main.deck:
+			if true:
 				var p: Vector2 = main.tile_pos(t)
 				var pts := PackedVector2Array([p + Vector2(0, -main.HH), p + Vector2(main.HW, 0),
 					p + Vector2(0, main.HH), p + Vector2(-main.HW, 0), p + Vector2(0, -main.HH)])
@@ -2039,3 +2190,33 @@ class GridNode extends Node2D:
 				if t == main.DOOR:
 					col = Color(1, 0.5, 0.5, 0.4)
 				draw_polyline(pts, col, 1.0)
+
+
+## Slowly drifting clouds behind the ship (screen space).
+class CloudNode extends Node2D:
+	var clouds: Array = []
+
+	func _ready() -> void:
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 11
+		for i in 9:
+			clouds.append({"pos": Vector2(rng.randf_range(0, 700), rng.randf_range(150, 350)),
+				"speed": rng.randf_range(4, 12), "size": rng.randf_range(14, 30), "far": rng.randf() < 0.5})
+
+	func _process(delta: float) -> void:
+		for c in clouds:
+			c["pos"].x -= c["speed"] * delta
+			if c["pos"].x < -120:
+				c["pos"].x = 760
+		queue_redraw()
+
+	func _draw() -> void:
+		for c in clouds:
+			var col := Color("6c4f8e") if c["far"] else Color("8a6aaa")
+			var top := Color("8d70ad") if c["far"] else Color("b49bd0")
+			var p: Vector2 = c["pos"].round()
+			var s: float = c["size"]
+			for j in 4:
+				var o := Vector2(j * s * 0.8 - s * 1.2, sin(j * 2.1) * s * 0.25)
+				draw_circle(p + o, s * (0.7 + 0.2 * (j % 2)), col)
+				draw_circle(p + o + Vector2(0, -3), s * (0.6 + 0.2 * (j % 2)), top)

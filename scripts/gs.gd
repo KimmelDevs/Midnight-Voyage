@@ -97,6 +97,21 @@ const ITEMS := {
 
 const DAY_LENGTH := 150.0   # seconds the café is open each day
 
+## ---- the Sky Café airship: the café map is the ship's deck ----
+## Deck mask: row = r, character index = c ("X" = deck tile). The long axis
+## runs along c (stern at c = 0, bow at the far end). Saved per game so the
+## ship can be expanded tile by tile later.
+const SHIP_TEMPLATE := [
+	"XXXXXXXXXXXX",
+	"XXXXXXXXXXXX",
+	"XXXXXXXXXXXX",
+	"XXXXXXXXXXXX",
+	"XXXXXXXXXXXX",
+	"XXXXXXXXXXXX",
+]
+const SHIP_CABIN := [0, 0, 6, 4]     ## [c, r, width, height] indoor café cabin at the stern
+const SHIP_GANGWAY := [6, 5]         ## deck tile where customers come aboard
+
 ## ---- shared progression (one source of truth for café AND battle) ----
 const MAX_LEVEL := 30
 ## Per-level growth of the five core stats; rarity = specialisation/potential.
@@ -106,8 +121,44 @@ const GROWTH := {"R": 0.06, "SR": 0.065, "SSR": 0.07}
 const MATERIALS := {
 	"golden_sugar": {"name": "Golden Sugar", "desc": "Next dish cooked is one star better"},
 	"training_manual": {"name": "Training Manual", "desc": "+120 XP to one character"},
+	"build_mats": {"name": "Building Materials", "desc": "Timber, stone and nails for town upgrades"},
 }
 const MANUAL_XP := 120
+## ---- starting island: town buildings (the café itself lives on the ship) ----
+const ISLAND_SIZE := 24                       ## island grid is ISLAND_SIZE x ISLAND_SIZE tiles
+const CORE_AREA := Rect2i(4, 4, 16, 16)       ## buildable before the Town Hall Lv 5 expansion
+const EXPANDED_AREA := Rect2i(1, 1, 22, 22)
+const MAX_FACILITY_LEVEL := 5
+## size = footprint in island tiles; th = Town Hall level that unlocks it;
+## phase > 1 = planned for a later update (shown as coming soon).
+const BUILDINGS := {
+	"town_hall":  {"name": "Town Hall", "size": Vector2i(5, 5), "th": 1, "phase": 1,
+		"desc": "Sets the level cap of every facility and unlocks new buildings and land."},
+	"shop":       {"name": "General Shop", "size": Vector2i(3, 3), "th": 1, "phase": 1,
+		"desc": "Furniture, cooking supplies and building materials. Higher levels stock more."},
+	"tavern":     {"name": "Recruitment Tavern", "size": Vector2i(3, 3), "th": 1, "phase": 1,
+		"desc": "Summon crew. Upgrades add conveniences (daily ticket, cheaper 10-pull), never better odds."},
+	"guild":      {"name": "Adventurers' Guild", "size": Vector2i(3, 3), "th": 3, "phase": 1,
+		"desc": "Bounties and tougher battles. Each level opens harder encounters.",
+		"build": {"coins": 1500, "mats": 15}},
+	"blacksmith": {"name": "Blacksmith", "size": Vector2i(3, 3), "th": 2, "phase": 2,
+		"desc": "Forge weapons and combat equipment."},
+	"farm":       {"name": "Farm & Garden", "size": Vector2i(4, 3), "th": 2, "phase": 2,
+		"desc": "Grows ingredients and magical herbs for the café."},
+	"alchemy":    {"name": "Alchemy Workshop", "size": Vector2i(3, 3), "th": 4, "phase": 3,
+		"desc": "Potions, food enhancements and upgrade materials."},
+}
+## Requirements to RAISE the Town Hall to the given level.
+const TH_REQUIREMENTS := {
+	2: {"coins": 800, "mats": 10, "facilities": {"cafe": 1}, "served": 30, "clear": ""},
+	3: {"coins": 5000, "mats": 30, "facilities": {"cafe": 2, "shop": 2}, "served": 100, "clear": "sweet_trouble"},
+	4: {"coins": 12000, "mats": 60, "facilities": {"cafe": 3, "tavern": 2, "guild": 2}, "served": 250,
+		"clear": "kitchen_haunt"},
+	5: {"coins": 25000, "mats": 120, "facilities": {"cafe": 4, "shop": 3, "guild": 3}, "served": 500,
+		"clear": "sugar_golem"},
+}
+const MATS_PRICE := 45                        ## coins per Building Material at the General Shop
+
 ## Packing a battle meal costs this many times the dish price.
 const MEAL_COST_MULT := 2
 
@@ -120,11 +171,15 @@ var staff: Dictionary = {}           # key -> {level, xp, role, mastery:{job:xp}
 var served_total := 0
 var day := 1
 var placed: Array = []        # [{item, c, r, rot 0..3}]
+var ship: Dictionary = {}       # {deck: [row strings], cabin: [c, r, w, h], gangway: [c, r]}
 var inventory: Dictionary = {}  # item -> count owned but not placed
 var meals: Array = []           # packed battle meals [{food, tier}] (cooked by the café kitchen)
 var tickets := 0                # summon tickets (1 ticket = 1 pull)
 var materials: Dictionary = {}  # material -> count
 var cleared: Dictionary = {}    # encounter id -> victories
+## Island town. th = Town Hall level (single source); cafe = ship café level.
+## buildings: [{id, x, y, level}] footprints on the island grid.
+var town: Dictionary = {}
 var battle_hp: Dictionary = {}  # crew key -> HP ratio carried between battles (reset each new day)
 
 
@@ -151,6 +206,7 @@ func new_game() -> void:
 		staff["leo"] = new_member("Waiter")
 	served_total = 0
 	day = 1
+	ship = default_ship()
 	placed = default_layout(2)
 	inventory = {}
 	meals = []
@@ -158,6 +214,7 @@ func new_game() -> void:
 	materials = {}
 	cleared = {}
 	battle_hp = {}
+	town = default_town()
 
 
 ## A crew member's permanent record. mastery (job -> XP) and bond are
@@ -190,7 +247,7 @@ func roll_rarity(min_sr: bool = false) -> String:
 
 ## Returns [{key, new:bool, level:int}] or [] if not enough gems.
 func pull(count: int) -> Array:
-	var cost := PULL10_COST if count == 10 else PULL_COST * count
+	var cost := pull10_cost() if count == 10 else PULL_COST * count
 	if gems < cost:
 		return []
 	gems -= cost
@@ -320,6 +377,184 @@ func use_material(id: String) -> bool:
 	return true
 
 
+# ------------------------------------------------------------------ town
+func default_town() -> Dictionary:
+	return {
+		"th": 1, "cafe": 1, "expanded": false,
+		"buildings": [
+			{"id": "town_hall", "x": 10, "y": 9, "level": 1},
+			{"id": "shop", "x": 6, "y": 15, "level": 1},
+			{"id": "tavern", "x": 15, "y": 6, "level": 1},
+		],
+	}
+
+
+func th_level() -> int:
+	return int(town["th"])
+
+
+## Level of a facility ("cafe" = the ship café); 0 if not built.
+func facility_level(id: String) -> int:
+	if id == "cafe":
+		return int(town["cafe"])
+	if id == "town_hall":
+		return th_level()
+	for b in town["buildings"]:
+		if b["id"] == id:
+			return int(b["level"])
+	return 0
+
+
+func building_entry(id: String) -> Dictionary:
+	for b in town["buildings"]:
+		if b["id"] == id:
+			return b
+	return {}
+
+
+func mats() -> int:
+	return int(materials.get("build_mats", 0))
+
+
+## Coins + materials to raise a facility (not the Town Hall) to `to_level`.
+func facility_cost(to_level: int) -> Dictionary:
+	return {"coins": int(250 * pow(to_level, 1.7)), "mats": 4 * to_level}
+
+
+## [{text, done}] checklist for the next Town Hall level (empty at max).
+func th_checklist() -> Array:
+	var next := th_level() + 1
+	if not TH_REQUIREMENTS.has(next):
+		return []
+	var r: Dictionary = TH_REQUIREMENTS[next]
+	var out: Array = []
+	out.append({"text": "%d coins" % r["coins"], "done": coins >= int(r["coins"])})
+	out.append({"text": "%d Building Materials" % r["mats"], "done": mats() >= int(r["mats"])})
+	for f in r["facilities"]:
+		var name: String = "Café (ship)" if f == "cafe" else BUILDINGS[f]["name"]
+		out.append({"text": "%s Lv %d" % [name, r["facilities"][f]], "done": facility_level(f) >= int(r["facilities"][f])})
+	out.append({"text": "Serve %d customers (%d)" % [r["served"], served_total], "done": served_total >= int(r["served"])})
+	if r["clear"] != "":
+		out.append({"text": "Win the battle: %s" % BattleDB.encounter(StringName(r["clear"])).display_name,
+			"done": int(cleared.get(r["clear"], 0)) > 0})
+	return out
+
+
+func upgrade_town_hall() -> bool:
+	var list := th_checklist()
+	if list.is_empty():
+		return false
+	for item in list:
+		if not item["done"]:
+			return false
+	var r: Dictionary = TH_REQUIREMENTS[th_level() + 1]
+	coins -= int(r["coins"])
+	materials["build_mats"] = mats() - int(r["mats"])
+	town["th"] = th_level() + 1
+	for b in town["buildings"]:
+		if b["id"] == "town_hall":
+			b["level"] = town["th"]
+	if th_level() >= 5:
+		town["expanded"] = true
+	changed.emit()
+	save_game()
+	return true
+
+
+## Why a facility can't be upgraded right now ("" = it can).
+func facility_block(id: String) -> String:
+	var lv := facility_level(id)
+	if lv <= 0:
+		return "Not built yet."
+	if lv >= MAX_FACILITY_LEVEL:
+		return "Max level."
+	if lv >= th_level():
+		return "Upgrade the Town Hall first (cap Lv %d)." % th_level()
+	var c := facility_cost(lv + 1)
+	if coins < int(c["coins"]) or mats() < int(c["mats"]):
+		return "Needs %d coins and %d Building Materials." % [c["coins"], c["mats"]]
+	return ""
+
+
+func upgrade_facility(id: String) -> bool:
+	if facility_block(id) != "":
+		return false
+	var c := facility_cost(facility_level(id) + 1)
+	coins -= int(c["coins"])
+	materials["build_mats"] = mats() - int(c["mats"])
+	if id == "cafe":
+		town["cafe"] = int(town["cafe"]) + 1
+	else:
+		building_entry(id)["level"] = int(building_entry(id)["level"]) + 1
+	changed.emit()
+	save_game()
+	return true
+
+
+func build_block(id: String) -> String:
+	var d: Dictionary = BUILDINGS[id]
+	if facility_level(id) > 0:
+		return "Already built."
+	if int(d["phase"]) > 1:
+		return "Coming in a later update."
+	if th_level() < int(d["th"]):
+		return "Needs Town Hall Lv %d." % d["th"]
+	var c: Dictionary = d.get("build", {"coins": 0, "mats": 0})
+	if coins < int(c["coins"]) or mats() < int(c["mats"]):
+		return "Needs %d coins and %d Building Materials." % [c["coins"], c["mats"]]
+	return ""
+
+
+func build(id: String, x: int, y: int) -> bool:
+	if build_block(id) != "":
+		return false
+	var c: Dictionary = BUILDINGS[id].get("build", {"coins": 0, "mats": 0})
+	coins -= int(c["coins"])
+	materials["build_mats"] = mats() - int(c["mats"])
+	town["buildings"].append({"id": id, "x": x, "y": y, "level": 1})
+	changed.emit()
+	save_game()
+	return true
+
+
+func buildable_area() -> Rect2i:
+	return EXPANDED_AREA if town.get("expanded", false) else CORE_AREA
+
+
+## General Shop: buy Building Materials (shop level gives a discount).
+func mats_price() -> int:
+	return int(MATS_PRICE * (1.0 - 0.05 * (facility_level("shop") - 1)))
+
+
+func buy_mats(n: int) -> bool:
+	if coins < mats_price() * n:
+		return false
+	coins -= mats_price() * n
+	add_material("build_mats", n)
+	save_game()
+	return true
+
+
+## Café (ship) level: +10% dish prices per level above 1.
+func cafe_price_mult() -> float:
+	return 1.0 + 0.1 * (facility_level("cafe") - 1)
+
+
+## Recruitment Tavern conveniences (never better odds).
+func pull10_cost() -> int:
+	return PULL10_COST - (50 if facility_level("tavern") >= 3 else 0)
+
+
+## Called when a new café day starts.
+func new_day() -> Array[String]:
+	var notes: Array[String] = []
+	rest_crew()
+	if facility_level("tavern") >= 2:
+		tickets += 1
+		notes.append("The Tavern left you a free Summon Ticket.")
+	return notes
+
+
 ## HP a crew member starts a battle with. Knocked-out crew limp in at 25%.
 func battle_hp_ratio(key: String) -> float:
 	return clampf(float(battle_hp.get(key, 1.0)), 0.25, 1.0)
@@ -409,18 +644,42 @@ func unlock_food(key: String) -> bool:
 
 
 ## Starting café. `tables` (2-4) keeps tables bought in pre-layout saves.
+func default_ship() -> Dictionary:
+	return {"deck": SHIP_TEMPLATE.duplicate(), "cabin": SHIP_CABIN.duplicate(), "gangway": SHIP_GANGWAY.duplicate()}
+
+
+## Starting café on the ship. Kitchen + one table in the cabin, `tables`
+## (2-4) more tables out on the open deck.
 func default_layout(tables: int) -> Array:
 	var out: Array = []
-	for e in [["stove", 0, 1], ["espresso", 0, 2], ["service_counter", 0, 3], ["sink", 0, 4],
-			["dish_rack", 0, 5], ["fridge", 1, 0], ["plant", 6, 5], ["lamp", 4, 0]]:
+	for e in [["stove", 0, 1], ["espresso", 0, 2], ["service_counter", 0, 3], ["fridge", 1, 0],
+			["sink", 2, 0], ["dish_rack", 3, 0], ["display", 5, 0], ["lamp", 6, 0],
+			["fern", 11, 0], ["chalkboard", 5, 5], ["plant", 11, 5]]:
 		out.append({"item": e[0], "c": e[1], "r": e[2], "rot": 0})
-	var spots := [Vector2i(3, 2), Vector2i(5, 2), Vector2i(3, 4), Vector2i(5, 4)]
-	for i in clampi(tables, 2, 4):
+	var spots := [Vector2i(3, 2), Vector2i(8, 2), Vector2i(10, 4), Vector2i(8, 4), Vector2i(10, 2)]
+	for i in clampi(tables + 1, 3, 5):
 		var t: Vector2i = spots[i]
 		out.append({"item": "table_round", "c": t.x, "r": t.y, "rot": 0})
 		out.append({"item": "chair", "c": t.x - 1, "r": t.y, "rot": 0})   # faces SE
 		out.append({"item": "chair", "c": t.x, "r": t.y - 1, "rot": 1})   # faces SW
 	return out
+
+
+## Moving from the old one-room café to the ship: rebuild the starting
+## layout and put any furniture beyond it into storage.
+func migrate_to_ship(old_placed: Array) -> void:
+	var counts := {}
+	var tables := 0
+	for p in old_placed:
+		counts[p["item"]] = int(counts.get(p["item"], 0)) + 1
+		if ITEMS[p["item"]]["kind"] == "table":
+			tables += 1
+	placed = default_layout(clampi(tables, 2, 4))
+	for p in placed:
+		counts[p["item"]] = int(counts.get(p["item"], 0)) - 1
+	for item in counts:
+		if counts[item] > 0:
+			inventory[item] = int(inventory.get(item, 0)) + counts[item]
 
 
 func item_tex_path(item: String) -> String:
@@ -472,10 +731,10 @@ func save_game() -> void:
 	var data := {
 		"coins": coins, "gems": gems, "rep_level": rep_level, "rep_xp": rep_xp,
 		"unlocked": unlocked, "staff": staff,
-		"served_total": served_total, "version": 3,
+		"served_total": served_total, "version": 5, "ship": ship,
 		"day": day, "placed": placed, "inventory": inventory,
 		"meals": meals, "tickets": tickets, "materials": materials, "cleared": cleared,
-		"battle_hp": battle_hp,
+		"battle_hp": battle_hp, "town": town,
 	}
 	var f := FileAccess.open(save_path, FileAccess.WRITE)
 	if f:
@@ -502,6 +761,9 @@ func load_game() -> bool:
 			placed.append({"item": p["item"], "c": int(p["c"]), "r": int(p["r"]), "rot": int(p.get("rot", 0)) % 4})
 	if placed.is_empty():  # pre-layout save: rebuild with the tables bought back then
 		placed = default_layout(int(d.get("tables_owned", 2)))
+	ship = d.get("ship", {})
+	if ship.is_empty() or int(d.get("version", 1)) < 5:  # v4 test ship had a different outline
+		ship = default_ship()
 	meals = []
 	for m in d.get("meals", []):
 		if FOODS.has(m.get("food", "")) and str(m.get("tier", "")) in TIERS:
@@ -514,6 +776,18 @@ func load_game() -> bool:
 			materials[k] = int(mats[k])
 	cleared = d.get("cleared", {})
 	battle_hp = d.get("battle_hp", {})
+	town = default_town()
+	var tw: Dictionary = d.get("town", {})
+	if not tw.is_empty():
+		town["th"] = clampi(int(tw.get("th", 1)), 1, 5)
+		town["cafe"] = clampi(int(tw.get("cafe", 1)), 1, MAX_FACILITY_LEVEL)
+		town["expanded"] = bool(tw.get("expanded", false))
+		var bl: Array = []
+		for b in tw.get("buildings", []):
+			if BUILDINGS.has(b.get("id", "")):
+				bl.append({"id": b["id"], "x": int(b["x"]), "y": int(b["y"]), "level": int(b.get("level", 1))})
+		if not bl.is_empty():
+			town["buildings"] = bl
 	inventory = {}
 	var inv: Dictionary = d.get("inventory", {})
 	for k in inv:
@@ -535,4 +809,21 @@ func load_game() -> bool:
 			staff[k] = m
 	if staff.is_empty():
 		staff = {"hana": new_member("Chef")}
+	if int(d.get("version", 1)) < 4:  # one-room café -> the airship deck
+		migrate_to_ship(placed)
+	_store_off_deck()
 	return true
+
+
+## Anything standing where there is no deck goes back into storage.
+func _store_off_deck() -> void:
+	var rows: Array = ship["deck"]
+	var keep: Array = []
+	for p in placed:
+		var r := int(p["r"])
+		var c := int(p["c"])
+		if r >= 0 and r < rows.size() and c >= 0 and c < str(rows[r]).length() and str(rows[r])[c] == "X":
+			keep.append(p)
+		else:
+			inventory[p["item"]] = int(inventory.get(p["item"], 0)) + 1
+	placed = keep
