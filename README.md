@@ -23,3 +23,13 @@ Isometric pixel-art café sim built in Godot 4.7: serve food, unlock recipes, an
 - Rules live in `scripts/ship/` (ShipData, ShipStats, VoyageManager); state in `GS.airship`.
 - Font: Pixel Operator (CC0) in `assets/fonts/`, drawn at native 8 px / 16 px titles.
 - Test flags: `-- --test-save --demo-ship`, `--demo-voyage [--demo-routes] [--demo-ambush] [--demo-return]`.
+
+## Level editor
+
+Open `scenes/level_editor.tscn` in Godot and press F6 (Run Current Scene).
+Pick a piece from the palette (Floors, Furniture, Walls, Ship, Island) and build on the iso grid.
+
+- Left click / drag: place. Right click / drag: erase.
+- R: rotate (furniture turns, walls/hull/cliffs move to the next tile edge, free pieces mirror).
+- G: grid. Tab: hide palette. WASD or middle-drag: pan. Wheel: zoom.
+- Save writes `scenes/levels/<name>.tscn` (a normal scene you can open or instance) and `<name>.json` (pick it in the drop-down and click Load to keep editing).
