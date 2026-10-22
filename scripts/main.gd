@@ -362,27 +362,36 @@ func free_spot(want: Vector2i) -> Vector2i:
 	return best
 
 
-## Every solid item must keep a walkable side reachable from the door
-## (tables are exempt: they are reached through the chairs around them).
+## Placement is fine as long as everything people actually use stays reachable
+## from the door: work stations (stove, espresso, counter, sink) and chairs that
+## face a table. Decor, tables, fridges, racks and spare chairs may block freely.
 func layout_ok(extra_solid: Vector2i = Vector2i(-1, -1)) -> bool:
-	var solid := func(t: Vector2i) -> bool:
-		return t == extra_solid or occupied.has(t)
+	var extra_kind := "" if held.is_empty() else _kind(held["item"])
+	var extra_rot: int = 0 if held.is_empty() else held["rot"]
+	var kind_at := func(t: Vector2i) -> String:
+		if t == extra_solid:
+			return extra_kind
+		return _kind(GS.placed[occupied[t]]["item"]) if occupied.has(t) else ""
 	var seen := {DOOR: true}
 	var queue: Array[Vector2i] = [DOOR]
 	while not queue.is_empty():
 		var t: Vector2i = queue.pop_front()
 		for d in ROT_DIRS:
 			var n: Vector2i = t + d
-			if in_room(n) and not seen.has(n) and not solid.call(n):
+			if in_room(n) and not seen.has(n) and kind_at.call(n) == "":
 				seen[n] = true
 				queue.append(n)
-	var check: Array = []
-	for t in occupied:
-		if _kind(GS.placed[occupied[t]]["item"]) != "table":
-			check.append(t)
-	if in_room(extra_solid) and not (held.size() > 0 and _kind(held["item"]) == "table"):
-		check.append(extra_solid)
-	for t in check:
+	var tiles: Array = occupied.keys()
+	if in_room(extra_solid):
+		tiles.append(extra_solid)
+	for t in tiles:
+		var k: String = kind_at.call(t)
+		var needs := k in ["stove", "espresso", "counter", "sink"]
+		if k == "chair":
+			var rot: int = extra_rot if t == extra_solid else GS.placed[occupied[t]]["rot"]
+			needs = kind_at.call(t + ROT_DIRS[rot]) == "table"
+		if not needs:
+			continue
 		var ok := false
 		for d in ROT_DIRS:
 			if seen.has(t + d):
@@ -1597,7 +1606,7 @@ func _can_place(t: Vector2i) -> bool:
 func _place(t: Vector2i) -> void:
 	if not _can_place(t):
 		var free := in_room(t) and not occupied.has(t) and t != DOOR
-		_toast("Can't place there - it would block a path." if free else "That spot is taken.")
+		_toast("Can't place there - a station or seat would be cut off from the door." if free else "That spot is taken.")
 		return
 	GS.placed.append({"item": held["item"], "c": t.x, "r": t.y, "rot": held["rot"]})
 	held = {}
