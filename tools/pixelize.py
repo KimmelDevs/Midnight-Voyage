@@ -99,7 +99,20 @@ def pixelize(rgb, mask, box, factor, pal_img, alpha_vote=0.5):
             idx = Counter(bq.tolist()).most_common(1)[0][0]
             out[oy, ox, :3] = pal[idx]
             out[oy, ox, 3] = 255
-    return Image.fromarray(out, "RGBA")
+    return Image.fromarray(defringe(out), "RGBA")
+
+
+def defringe(px):
+    """Recolor magenta-tinted edge pixels (background bleed) to a dark outline."""
+    h, w = px.shape[:2]
+    r, g, b, a = (px[:, :, i].astype(int) for i in range(4))
+    pink = (a > 0) & (r - g > 60) & (b - g > 40) & (b > 70)
+    for y, x in zip(*np.nonzero(pink)):
+        edge = any(not (0 <= y + dy < h and 0 <= x + dx < w) or px[y + dy, x + dx, 3] == 0
+                   for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+        if edge:
+            px[y, x, :3] = (52, 30, 40)
+    return px
 
 
 def trim(img):

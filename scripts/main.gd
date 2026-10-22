@@ -69,6 +69,13 @@ func _ready() -> void:
 	GS.changed.connect(_refresh_hud)
 	_refresh_hud()
 	_toast("Welcome to the Midnight Voyage Café!")
+	# `godot -- --demo-summon` showcases a 10-pull (used for screenshots/tests)
+	if "--demo-summon" in OS.get_cmdline_user_args():
+		await get_tree().create_timer(1.0).timeout
+		GS.gems += GS.PULL10_COST
+		_open_summon()
+		await get_tree().create_timer(1.0).timeout
+		_do_pull(10, overlay.get_child(1).get_child(0).get_child(1).get_child(0))
 
 
 func tex(path: String) -> Texture2D:
@@ -697,10 +704,11 @@ func _open_menu() -> void:
 func _portrait(key: String) -> TextureRect:
 	var at := AtlasTexture.new()
 	at.atlas = tex("res://assets/chars/%s.png" % GS.STAFF[key]["sheet"])
-	at.region = Rect2(48, 0, 48, 64)
+	var fw := at.atlas.get_width() / 3.0
+	at.region = Rect2(fw, 0, fw, 64)
 	var tr := TextureRect.new()
 	tr.texture = at
-	tr.custom_minimum_size = Vector2(48, 64)
+	tr.custom_minimum_size = Vector2(fw, 64)
 	return tr
 
 
@@ -780,6 +788,33 @@ func _do_pull(n: int, machine: Control) -> void:
 		tw.tween_property(machine, "position:x", machine.position.x + (3 if i % 2 == 0 else -3), 0.05)
 	tw.tween_property(machine, "position:x", machine.position.x, 0.05)
 	await tw.finished
+	# a capsule of the best rarity pops out, wobbles, then bursts
+	var best := "r"
+	for r in results:
+		var rar: String = GS.STAFF[r["key"]]["rarity"]
+		if rar == "SSR" or (rar == "SR" and best == "r"):
+			best = rar.to_lower()
+	var cap := TextureRect.new()
+	cap.texture = tex("res://assets/gacha/capsule_%s.png" % best)
+	cap.position = Vector2(304, 140)
+	cap.pivot_offset = Vector2(16, 16)
+	overlay.add_child(cap)
+	var ctw := create_tween()
+	ctw.tween_property(cap, "position:y", 170.0, 0.35).set_trans(Tween.TRANS_BOUNCE).set_ease(Tween.EASE_OUT)
+	for i in 4:
+		ctw.tween_property(cap, "rotation", 0.3 if i % 2 == 0 else -0.3, 0.08)
+	ctw.tween_property(cap, "rotation", 0.0, 0.08)
+	await ctw.finished
+	var spark := TextureRect.new()
+	spark.texture = tex("res://assets/gacha/sparkle.png")
+	spark.position = cap.position - Vector2(-4, -4)
+	spark.pivot_offset = Vector2(12, 12)
+	overlay.add_child(spark)
+	cap.queue_free()
+	var stw := create_tween()
+	stw.tween_property(spark, "scale", Vector2(4, 4), 0.3)
+	stw.parallel().tween_property(spark, "modulate:a", 0.0, 0.3)
+	await stw.finished
 	var flash := ColorRect.new()
 	flash.color = Color.WHITE
 	flash.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -811,8 +846,8 @@ func _show_results(results: Array) -> void:
 		if frame_tex:
 			var sbt := StyleBoxTexture.new()
 			sbt.texture = frame_tex
-			sbt.set_texture_margin_all(6)
-			sbt.set_content_margin_all(6)
+			sbt.set_texture_margin_all(10 if d["rarity"] == "SSR" else 8)
+			sbt.set_content_margin_all(7)
 			card.add_theme_stylebox_override("panel", sbt)
 		else:
 			card.add_theme_stylebox_override("panel", _sb(Color("2e2240"), RARITY_COL[d["rarity"]], 3, 4))
@@ -823,11 +858,11 @@ func _show_results(results: Array) -> void:
 		pr.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		cv.add_child(pr)
 		var nl := _small_label("%s %s" % [d["rarity"], d["name"]], 9)
-		nl.add_theme_color_override("font_color", RARITY_COL[d["rarity"]])
+		nl.add_theme_color_override("font_color", C_TEXT if frame_tex else RARITY_COL[d["rarity"]])
 		nl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		cv.add_child(nl)
 		var tag := _small_label("NEW!" if r["new"] else "Lv %d" % r["level"], 9)
-		tag.add_theme_color_override("font_color", Color("ffffff"))
+		tag.add_theme_color_override("font_color", C_PINK_DK if frame_tex else Color("ffffff"))
 		tag.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		cv.add_child(tag)
 		card.modulate.a = 0.0

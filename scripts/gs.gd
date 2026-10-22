@@ -54,6 +54,9 @@ var served_total := 0
 func _ready() -> void:
 	if not load_game():
 		new_game()
+	# starter waiter joins once his art exists (older saves included)
+	if not staff.has("leo") and sheet_exists("leo"):
+		staff["leo"] = {"level": 1, "role": "Waiter"}
 
 
 func new_game() -> void:
