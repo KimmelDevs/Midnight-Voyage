@@ -21,7 +21,7 @@ from PIL import Image
 
 MAGENTA = np.array([255, 0, 255])
 FIT = True
-SHEET_PITCH = None
+MULT = 0
 
 
 def load(path, key_dist):
@@ -159,7 +159,57 @@ def pixelize_fit(rgb, mask, box, factor, pal_img, alpha_vote=0.5):
     return Image.fromarray(defringe(out), "RGBA")
 
 
+def pixelize_multiple(rgb, mask, box, mult, pal_img, alpha_vote=0.5):
+    """Sample at an exact multiple of the sprite's own true pixel pitch.
+
+    Prop/food sheets are drawn finer (~2.7-4px) than characters, so landing
+    on their grid at game scale means taking every 2nd/3rd grid line and
+    voting over the whole block.
+    """
+    x0, y0, x1, y1 = box
+    h, w = mask.shape
+    x0, y0, x1, y1 = max(0, x0 - 4), max(0, y0 - 4), min(w, x1 + 4), min(h, y1 + 4)
+    crop = rgb[y0:y1, x0:x1].astype(float)
+    # one square pitch per sprite, scored on both axes together (per-axis
+    # estimates sometimes lock onto a sub-multiple and distort the aspect)
+    profs = []
+    for ax in (1, 0):
+        prof = _edge_profile(crop, ax)
+        profs.append(prof / (prof.mean() + 1e-9))
+
+    def both(p):
+        (sx, fx_), (sy, fy_) = _grid_score(profs[0], p), _grid_score(profs[1], p)
+        return sx + sy, fx_, fy_
+
+    scores = [(p, both(p)[0]) for p in np.arange(2.5, 7.0, 0.02)]
+    top = max(s for _, s in scores)
+    est = min(p for p, s in scores if s >= 0.9 * top)
+    p = max(np.arange(est - 0.12, est + 0.12, 0.01), key=lambda q: both(q)[0])
+    _, fx, fy = both(p)
+    px = py = p * mult
+    q = np.array(Image.fromarray(crop.astype(np.uint8), "RGB").quantize(palette=pal_img, dither=Image.Dither.NONE))
+    pal = np.array(pal_img.getpalette()[: 3 * 256]).reshape(-1, 3)
+    m = mask[y0:y1, x0:x1]
+    k = 0.25 if mult == 1 else 0.08  # centre sample for 1x, whole block vote for multiples
+    xs = np.arange(fx, crop.shape[1] - px * 0.5, px)
+    ys = np.arange(fy, crop.shape[0] - py * 0.5, py)
+    out = np.zeros((len(ys), len(xs), 4), dtype=np.uint8)
+    for j, yy in enumerate(ys):
+        a0, a1 = int(yy + py * k), int(yy + py * (1 - k)) + 1
+        for i, xx in enumerate(xs):
+            b0, b1 = int(xx + px * k), int(xx + px * (1 - k)) + 1
+            bm = m[a0:a1, b0:b1]
+            if bm.size == 0 or bm.mean() < alpha_vote:
+                continue
+            idx = Counter(q[a0:a1, b0:b1][bm].tolist()).most_common(1)[0][0]
+            out[j, i, :3] = pal[idx]
+            out[j, i, 3] = 255
+    return Image.fromarray(defringe(out), "RGBA")
+
+
 def pixelize(rgb, mask, box, factor, pal_img, alpha_vote=0.5):
+    if MULT:
+        return pixelize_multiple(rgb, mask, box, MULT, pal_img, alpha_vote)
     if FIT:
         return pixelize_fit(rgb, mask, box, factor, pal_img, alpha_vote)
     x0, y0, x1, y1 = box
@@ -211,9 +261,11 @@ def main():
     ap.add_argument("--cell", default="48x64", help="grid mode: output cell WxH")
     ap.add_argument("--names", default="", help="objects mode: comma names in reading order")
     ap.add_argument("--no-fit", action="store_true", help="fixed integer factor instead of grid fitting")
+    ap.add_argument("--mult", type=int, default=0, help="sample at N x each sprite's true pixel pitch")
     a = ap.parse_args()
-    global FIT
+    global FIT, MULT
     FIT = not a.no_fit
+    MULT = a.mult
 
     rgb, mask = load(a.src, a.key)
     pal = build_palette(rgb, mask, a.colors)

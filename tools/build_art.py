@@ -20,11 +20,12 @@ def run(*args):
     subprocess.run([sys.executable, PX, *args], check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
 
 
-def objects(src, factor, dest, names):
-    """names: list of (index, name); unnamed components are dropped."""
+def objects(src, mult, dest, names):
+    """Sample at `mult` x each object's true pixel pitch.
+    names: list of (index, name); unnamed components are dropped."""
     tmp = os.path.join(OUT, "_tmp")
     shutil.rmtree(tmp, ignore_errors=True)
-    run("objects", os.path.join(SRC, src), tmp, "--factor", str(factor))
+    run("objects", os.path.join(SRC, src), tmp, "--mult", str(mult))
     os.makedirs(dest, exist_ok=True)
     for i, name in names:
         shutil.move(os.path.join(tmp, f"obj_{i:02d}.png"), os.path.join(dest, f"{name}.png"))
@@ -53,11 +54,15 @@ if __name__ == "__main__":
                    check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
     os.remove(grid)
     print("customers")
-    objects("mv_cafe_sheet.png", 5, os.path.join(OUT, "cafe"), CAFE)
+    objects("mv_cafe_sheet.png", 2, os.path.join(OUT, "cafe"), CAFE)
     print("cafe")
-    objects("mv_food_sheet.png", 5, os.path.join(OUT, "food"), list(enumerate(FOOD)))
-    objects("mv_food_sheet.png", 10, os.path.join(OUT, "food", "small"), list(enumerate(FOOD)))
+    food = list(enumerate(FOOD))
+    objects("mv_food_sheet.png", 1, os.path.join(OUT, "food"), food)                 # large showcase
+    objects("mv_food_sheet.png", 2, os.path.join(OUT, "food", "small"), food)        # bubbles + menu
+    objects("mv_food_sheet.png", 3, os.path.join(OUT, "food", "tiny"), food)         # plates on tables
     print("food")
-    objects("mv_gacha_sheet.png", 5, os.path.join(OUT, "gacha"), GACHA)
-    objects("mv_gacha_sheet.png", 9, os.path.join(OUT, "gacha"), [(5, "gem"), (11, "coin")])
+    gacha = os.path.join(OUT, "gacha")
+    objects("mv_gacha_sheet.png", 2, gacha, [g for g in GACHA if not g[1].startswith("frame")])
+    objects("mv_gacha_sheet.png", 1, gacha, [g for g in GACHA if g[1].startswith("frame")])
+    objects("mv_gacha_sheet.png", 3, gacha, [(5, "gem"), (11, "coin")])
     print("gacha")

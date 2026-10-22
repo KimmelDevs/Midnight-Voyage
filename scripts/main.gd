@@ -4,7 +4,7 @@ extends Node2D
 
 const HW := 29            # half tile width (px)
 const HH := 18            # half tile height (px)
-const TILE_ANCHOR := Vector2(29, 19)  # diamond centre inside the floor tile image
+const TILE_ANCHOR := Vector2(29, 18)  # diamond centre inside the floor tile image
 const COLS := 7
 const ROWS := 6
 const ORIGIN := Vector2(330, 92)   # top vertex of tile (0,0)
@@ -332,7 +332,7 @@ func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
 	await walk(a, PICKUP)
 	a.face_tile(COUNTER)
 	var dish := Sprite2D.new()
-	dish.texture = tex("res://assets/food/small/%s.png" % o["food"])
+	dish.texture = tex("res://assets/food/tiny/%s.png" % o["food"])
 	dish.position = tile_pos(COUNTER) + Vector2(-4 + counter_dishes.size() * 7, -30)
 	dish.z_index = 5
 	fx.add_child(dish)
@@ -354,7 +354,7 @@ func _do_deliver(key: String, a: Actor, o: Dictionary) -> void:
 	if c["state"] != "waiting":
 		orders.erase(o)
 		return
-	a.carry.texture = tex("res://assets/food/small/%s.png" % o["food"])
+	a.carry.texture = tex("res://assets/food/tiny/%s.png" % o["food"])
 	a.carry.visible = true
 	var chair: Dictionary = c["chair"]
 	await walk(a, free_neighbor(chair["tile"], a.tile))
@@ -419,7 +419,7 @@ func _customer_flow(c: Dictionary) -> void:
 	a.bubble.visible = false
 	if c["state"] == "served":
 		var plate := Sprite2D.new()
-		plate.texture = tex("res://assets/food/small/%s.png" % food)
+		plate.texture = tex("res://assets/food/tiny/%s.png" % food)
 		plate.position = tile_pos(c["table"]["tile"]) + Vector2(0, -22)
 		plate.z_index = 5
 		fx.add_child(plate)
@@ -677,7 +677,7 @@ func _open_menu() -> void:
 		row.custom_minimum_size = Vector2(196, 30)
 		var icon := TextureRect.new()
 		icon.texture = tex("res://assets/food/small/%s.png" % key)
-		icon.custom_minimum_size = Vector2(28, 28)
+		icon.custom_minimum_size = Vector2(32, 30)
 		icon.stretch_mode = TextureRect.STRETCH_KEEP_CENTERED
 		row.add_child(icon)
 		var info := VBoxContainer.new()
