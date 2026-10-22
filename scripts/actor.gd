@@ -6,7 +6,6 @@ extends Node2D
 signal arrived
 
 enum Dir { SE, SW, NE, NW }
-const FRAME_H := 64
 const WALK_CYCLE := [0, 1, 2, 1]
 
 var sprite: Sprite2D
@@ -26,16 +25,17 @@ func setup(tex: Texture2D, rows: int) -> void:
 	sprite.texture = tex
 	sprite.hframes = 3
 	sprite.vframes = rows
-	sprite.offset = Vector2(0, -FRAME_H / 2 + 3)
+	var frame_h := tex.get_height() / rows
+	sprite.offset = Vector2(0, -frame_h / 2 + 3)
 	add_child(sprite)
 	if rows == 2:
 		row_map = {Dir.SE: [0, true], Dir.SW: [0, false], Dir.NE: [1, true], Dir.NW: [1, false]}
 	bubble = Bubble.new()
-	bubble.position = Vector2(0, -FRAME_H - 4)
+	bubble.position = Vector2(0, -frame_h - 2)
 	bubble.visible = false
 	add_child(bubble)
 	carry = Sprite2D.new()
-	carry.position = Vector2(0, -FRAME_H + 2)
+	carry.position = Vector2(0, -frame_h + 6)
 	carry.visible = false
 	add_child(carry)
 	_set_frame(1)

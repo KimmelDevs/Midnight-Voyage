@@ -16,8 +16,11 @@ ap.add_argument("--cell", default="48x64")
 ap.add_argument("--start", type=int, default=0)
 a = ap.parse_args()
 
-cw, ch = (int(v) for v in a.cell.split("x"))
 grid = Image.open(a.src)
+if a.cell == "auto":
+    cw, ch = grid.width // 6, grid.height // 4
+else:
+    cw, ch = (int(v) for v in a.cell.split("x"))
 rows = grid.height // ch
 for r in range(rows):
     out = Image.new("RGBA", (cw * 3, ch * 2), (0, 0, 0, 0))

@@ -2,8 +2,9 @@ extends Node2D
 ## Isometric café: customers arrive, order food, chefs cook, waiters serve.
 ## Coins unlock menu items and tables; gems pull new staff from the gacha.
 
-const HW := 30            # half tile width (px)
-const HH := 17            # half tile height (px)
+const HW := 29            # half tile width (px)
+const HH := 18            # half tile height (px)
+const TILE_ANCHOR := Vector2(29, 19)  # diamond centre inside the floor tile image
 const COLS := 7
 const ROWS := 6
 const ORIGIN := Vector2(330, 92)   # top vertex of tile (0,0)
@@ -144,7 +145,7 @@ func _build_floor() -> void:
 			var s := Sprite2D.new()
 			s.texture = check if c <= 1 else wood
 			s.centered = false
-			s.position = tile_pos(Vector2i(c, r)) - Vector2(30, 18)
+			s.position = tile_pos(Vector2i(c, r)) - TILE_ANCHOR
 			s.z_index = -10
 			add_child(s)
 
@@ -705,10 +706,11 @@ func _portrait(key: String) -> TextureRect:
 	var at := AtlasTexture.new()
 	at.atlas = tex("res://assets/chars/%s.png" % GS.STAFF[key]["sheet"])
 	var fw := at.atlas.get_width() / 3.0
-	at.region = Rect2(fw, 0, fw, 64)
+	var fh := at.atlas.get_height() / 4.0
+	at.region = Rect2(fw, 0, fw, fh)
 	var tr := TextureRect.new()
 	tr.texture = at
-	tr.custom_minimum_size = Vector2(fw, 64)
+	tr.custom_minimum_size = Vector2(fw, fh)
 	return tr
 
 
