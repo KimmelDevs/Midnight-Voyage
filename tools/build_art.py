@@ -32,6 +32,16 @@ def objects(src, mult, dest, names):
     shutil.rmtree(tmp)
 
 
+def objects_fit(src, factor, dest, names):
+    """Like objects() but grid-fitted near a target factor (for oversized sources)."""
+    tmp = os.path.join(OUT, "_tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    run("objects", os.path.join(SRC, src), tmp, "--factor", str(factor))
+    for i, name in names:
+        shutil.move(os.path.join(tmp, f"obj_{i:02d}.png"), os.path.join(dest, f"{name}.png"))
+    shutil.rmtree(tmp)
+
+
 CHARS = {"chef": "mv_chef_iso.png", "leo": "mv_leo.png", "mira": "mv_mira.png",
          "kaito": "mv_kaito.png", "seraphine": "mv_seraphine.png", "selene": "mv_selene.png"}
 CAFE = [(0, "wall_left"), (1, "wall_right"), (2, "floor_wood"), (3, "floor_check"), (4, "counter"),
@@ -39,6 +49,13 @@ CAFE = [(0, "wall_left"), (1, "wall_right"), (2, "floor_wood"), (3, "floor_check
         (12, "plant")]
 FOOD = ["melon_soda", "latte", "coffee", "matcha", "shortcake", "choco_cake", "croissant", "pancakes",
         "ramen", "parfait", "omurice", "curry", "sandwich", "pudding", "macarons", "cookies"]
+FURNITURE = [(2, "stove"), (3, "sink"), (4, "dish_rack"), (5, "dish_tub"), (6, "espresso"), (7, "fridge"),
+             (8, "table_square"), (9, "prep_counter"), (10, "table_round"), (11, "chair"), (12, "bookshelf"),
+             (13, "lamp"), (14, "fern"), (15, "chalkboard"), (16, "trash"), (17, "rug")]
+# back views come out in a slightly different component order than the fronts
+FURNITURE_BACK = [(0, "stove"), (2, "sink"), (3, "dish_rack"), (4, "dish_tub"), (5, "espresso"),
+                  (6, "prep_counter"), (7, "fridge"), (8, "table_square"), (9, "table_round"), (10, "chair"),
+                  (11, "bookshelf"), (12, "lamp"), (13, "fern"), (14, "chalkboard"), (15, "trash"), (16, "rug")]
 GACHA = [(0, "machine"), (1, "capsule_r"), (2, "capsule_sr"), (3, "capsule_ssr"), (5, "gem_big"),
          (6, "ticket"), (8, "sparkle"), (11, "coin_big"), (15, "frame_r"), (16, "frame_sr"), (17, "frame_ssr")]
 
@@ -53,9 +70,20 @@ if __name__ == "__main__":
     subprocess.run([sys.executable, os.path.join(ROOT, "tools", "split_customers.py"), grid, chars, "--cell", "auto"],
                    check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
     os.remove(grid)
+    if os.path.exists(os.path.join(SRC, "mv_customers_sit.png")):  # SW-facing sitting poses
+        objects_fit("mv_customers_sit.png", 9.5, chars, [(1, "customer_0_sit"), (2, "customer_1_sit"),
+                                                      (3, "customer_2_sit"), (0, "customer_3_sit")])
+    for key in CHARS:  # combat / outside outfits shown in the gacha
+        src = os.path.join(SRC, f"mv_{key}_combat.png")
+        if os.path.exists(src):
+            run("grid", src, os.path.join(chars, f"{key}_combat.png"), "--height", "66", "--cell", "auto")
     print("customers")
     objects("mv_cafe_sheet.png", 2, os.path.join(OUT, "cafe"), CAFE)
     print("cafe")
+    objects("mv_utility.png", 2, os.path.join(OUT, "furniture"), FURNITURE)
+    if os.path.exists(os.path.join(SRC, "mv_utility_back.png")):  # back views for rotation
+        objects("mv_utility_back.png", 2, os.path.join(OUT, "furniture"), [(i, n + "_back") for i, n in FURNITURE_BACK])
+    print("furniture")
     food = list(enumerate(FOOD))
     objects("mv_food_sheet.png", 1, os.path.join(OUT, "food"), food)                 # large showcase
     objects("mv_food_sheet.png", 2, os.path.join(OUT, "food", "small"), food)        # bubbles + menu

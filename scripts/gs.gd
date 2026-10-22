@@ -63,8 +63,36 @@ const RATES := {"SSR": 0.05, "SR": 0.20, "R": 0.75}
 const PULL_COST := 100
 const PULL10_COST := 900
 
-const TABLE_COSTS := [0, 0, 250, 600]   # tables 1-2 free, 3-4 bought
 const GEM_TRADE := {"coins": 300, "gems": 50}
+
+## Placeable furniture. kind drives behaviour: stove (chefs cook), espresso
+## (baristas brew), counter (dishes wait for pickup), sink (dishes are washed),
+## rack (faster washing), fridge (faster cooking), table/chair (seating),
+## rug (walkable floor decor), deco (ambience: patience + tips).
+## Art lives in assets/furniture/<key>.png unless "tex" says otherwise.
+const ITEMS := {
+	"stove":           {"name": "Stove",           "kind": "stove",    "cost": 160},
+	"espresso":        {"name": "Espresso Machine", "kind": "espresso", "cost": 180},
+	"prep_counter":    {"name": "Prep Counter",    "kind": "counter",  "cost": 70},
+	"service_counter": {"name": "Service Counter", "kind": "counter",  "cost": 120, "tex": "cafe/counter"},
+	"sink":            {"name": "Sink",            "kind": "sink",     "cost": 120},
+	"dish_rack":       {"name": "Drying Rack",     "kind": "rack",     "cost": 60},
+	"dish_tub":        {"name": "Dish Tub",        "kind": "deco",     "cost": 30, "ambience": 0},
+	"fridge":          {"name": "Fridge",          "kind": "fridge",   "cost": 200},
+	"table_round":     {"name": "Round Table",     "kind": "table",    "cost": 90},
+	"table_square":    {"name": "Square Table",    "kind": "table",    "cost": 80},
+	"chair":           {"name": "Chair",           "kind": "chair",    "cost": 40, "back_flip": true},
+	"bookshelf":       {"name": "Bookshelf",       "kind": "deco",     "cost": 110, "ambience": 3},
+	"lamp":            {"name": "Standing Lamp",   "kind": "deco",     "cost": 70, "ambience": 2},
+	"fern":            {"name": "Potted Fern",     "kind": "deco",     "cost": 45, "ambience": 2},
+	"plant":           {"name": "Flower Pot",      "kind": "deco",     "cost": 45, "ambience": 2, "tex": "cafe/plant"},
+	"display":         {"name": "Pastry Display",  "kind": "deco",     "cost": 150, "ambience": 4, "tex": "cafe/display"},
+	"chalkboard":      {"name": "Menu Board",      "kind": "deco",     "cost": 60, "ambience": 2},
+	"trash":           {"name": "Trash Bin",       "kind": "deco",     "cost": 25, "ambience": 0},
+	"rug":             {"name": "Rug",             "kind": "rug",      "cost": 50, "ambience": 1},
+}
+
+const DAY_LENGTH := 150.0   # seconds the café is open each day
 
 var coins := 50
 var gems := 300
@@ -72,8 +100,10 @@ var rep_level := 1
 var rep_xp := 0
 var unlocked: Array = ["coffee", "croissant", "cookies"]
 var staff: Dictionary = {}           # key -> {level:int, role:String}
-var tables_owned := 2
 var served_total := 0
+var day := 1
+var placed: Array = []        # [{item, c, r, rot 0..3}]
+var inventory: Dictionary = {}  # item -> count owned but not placed
 
 
 func _ready() -> void:
@@ -93,8 +123,10 @@ func new_game() -> void:
 	staff = {"hana": {"level": 1, "role": "Chef"}}
 	if sheet_exists("leo"):
 		staff["leo"] = {"level": 1, "role": "Waiter"}
-	tables_owned = 2
 	served_total = 0
+	day = 1
+	placed = default_layout(2)
+	inventory = {}
 
 
 func sheet_exists(key: String) -> bool:
@@ -216,17 +248,55 @@ func unlock_food(key: String) -> bool:
 	return true
 
 
-func buy_table() -> bool:
-	if tables_owned >= TABLE_COSTS.size():
-		return false
-	var cost: int = TABLE_COSTS[tables_owned]
+## Starting café. `tables` (2-4) keeps tables bought in pre-layout saves.
+func default_layout(tables: int) -> Array:
+	var out: Array = []
+	for e in [["stove", 0, 1], ["espresso", 0, 2], ["service_counter", 0, 3], ["sink", 0, 4],
+			["dish_rack", 0, 5], ["fridge", 1, 0], ["plant", 6, 5], ["lamp", 4, 0]]:
+		out.append({"item": e[0], "c": e[1], "r": e[2], "rot": 0})
+	var spots := [Vector2i(3, 2), Vector2i(5, 2), Vector2i(3, 4), Vector2i(5, 4)]
+	for i in clampi(tables, 2, 4):
+		var t: Vector2i = spots[i]
+		out.append({"item": "table_round", "c": t.x, "r": t.y, "rot": 0})
+		out.append({"item": "chair", "c": t.x - 1, "r": t.y, "rot": 0})   # faces SE
+		out.append({"item": "chair", "c": t.x, "r": t.y - 1, "rot": 1})   # faces SW
+	return out
+
+
+func item_tex_path(item: String) -> String:
+	return "res://assets/%s.png" % ITEMS[item].get("tex", "furniture/" + item)
+
+
+func buy_item(item: String) -> bool:
+	var cost: int = ITEMS[item]["cost"]
 	if coins < cost:
 		return false
 	coins -= cost
-	tables_owned += 1
+	inventory[item] = int(inventory.get(item, 0)) + 1
 	changed.emit()
 	save_game()
 	return true
+
+
+func take_from_inventory(item: String) -> bool:
+	if int(inventory.get(item, 0)) <= 0:
+		return false
+	inventory[item] = int(inventory[item]) - 1
+	if inventory[item] <= 0:
+		inventory.erase(item)
+	return true
+
+
+func store_item(item: String) -> void:
+	inventory[item] = int(inventory.get(item, 0)) + 1
+
+
+## Ambience from placed decor: +2% patience and +1% tips per point.
+func ambience() -> int:
+	var a := 0
+	for p in placed:
+		a += int(ITEMS[p["item"]].get("ambience", 0))
+	return a
 
 
 func trade_gems() -> bool:
@@ -241,8 +311,9 @@ func trade_gems() -> bool:
 func save_game() -> void:
 	var data := {
 		"coins": coins, "gems": gems, "rep_level": rep_level, "rep_xp": rep_xp,
-		"unlocked": unlocked, "staff": staff, "tables_owned": tables_owned,
-		"served_total": served_total, "version": 2,
+		"unlocked": unlocked, "staff": staff,
+		"served_total": served_total, "version": 3,
+		"day": day, "placed": placed, "inventory": inventory,
 	}
 	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
 	if f:
@@ -261,8 +332,19 @@ func load_game() -> bool:
 	rep_level = int(d.get("rep_level", 1))
 	rep_xp = int(d.get("rep_xp", 0))
 	unlocked = d.get("unlocked", ["coffee"])
-	tables_owned = int(d.get("tables_owned", 2))
 	served_total = int(d.get("served_total", 0))
+	day = int(d.get("day", 1))
+	placed = []
+	for p in d.get("placed", []):
+		if ITEMS.has(p.get("item", "")):
+			placed.append({"item": p["item"], "c": int(p["c"]), "r": int(p["r"]), "rot": int(p.get("rot", 0)) % 4})
+	if placed.is_empty():  # pre-layout save: rebuild with the tables bought back then
+		placed = default_layout(int(d.get("tables_owned", 2)))
+	inventory = {}
+	var inv: Dictionary = d.get("inventory", {})
+	for k in inv:
+		if ITEMS.has(k):
+			inventory[k] = int(inv[k])
 	staff = {}
 	var s: Dictionary = d.get("staff", {})
 	for k in s:

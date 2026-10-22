@@ -1,7 +1,8 @@
 extends Node2D
 ## Isometric café: customers arrive and order; chefs cook, baristas brew,
-## waiters serve, hostesses greet, cleaners clear tables. Dishes earn star tiers.
-## Coins unlock menu items and tables; gems pull new staff from the gacha.
+## waiters serve, hostesses greet, cleaners wash dishes. Dishes earn star tiers.
+## Days: open -> closing -> night. At night the layout can be edited and
+## furniture bought in the shop placed and rotated.
 
 const HW := 29            # half tile width (px)
 const HH := 18            # half tile height (px)
@@ -12,18 +13,14 @@ const ORIGIN := Vector2(330, 92)   # top vertex of tile (0,0)
 const WALL_H := 74
 
 const DOOR := Vector2i(6, 0)
-const STOVE := Vector2i(0, 1)
-const COOK_SPOT := Vector2i(1, 1)
-const COUNTER := Vector2i(0, 3)
-const PICKUP := Vector2i(1, 3)
-const DISPLAY := Vector2i(0, 5)
-const PLANT := Vector2i(6, 5)
 const REST_SPOT := Vector2i(1, 5)
 const IDLE_SPOTS := {
-	"Chef": Vector2i(1, 2), "Barista": Vector2i(1, 4), "Waiter": Vector2i(2, 3),
+	"Chef": Vector2i(1, 2), "Barista": Vector2i(2, 2), "Waiter": Vector2i(2, 3),
 	"Hostess": Vector2i(6, 1), "Cleaner": Vector2i(2, 5), "Rest": REST_SPOT,
 }
-const TABLES: Array[Vector2i] = [Vector2i(3, 2), Vector2i(5, 2), Vector2i(3, 4), Vector2i(5, 4)]
+## rot 0..3: facing SE, SW, NW, NE (+c, +r, -c, -r). 0/1 use the front art
+## (1 mirrored); 2/3 use the <item>_back art when it exists.
+const ROT_DIRS: Array[Vector2i] = [Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 0), Vector2i(0, -1)]
 
 const C_TEXT := Color("4a2f2a")
 const C_PANEL := Color("f7e9d3")
@@ -31,60 +28,125 @@ const C_EDGE := Color("6b4630")
 const C_PINK := Color("e98b9c")
 const C_PINK_DK := Color("b85d70")
 const RARITY_COL := {"R": Color("aab4c4"), "SR": Color("b07ce8"), "SSR": Color("f2c14e")}
+const NIGHT_TINT := Color(0.55, 0.56, 0.82)
 
 var astar := AStarGrid2D.new()
 var world: Node2D
+var rug_layer: Node2D
 var fx: Node2D
 var ui: CanvasLayer
+var tint: CanvasModulate
 var hud_coins: Label
 var hud_gems: Label
 var hud_rep: Label
 var hud_bar: ProgressBar
+var hud_day: Label
 var toast_box: VBoxContainer
 var overlay: Control
-var tables: Array = []          # {tile, chairs:[{tile, dir, taken}], node, plate:Sprite2D}
-var counter_dishes: Array = []  # Sprite2D on counter
+var night_bar: VBoxContainer
+var edit_bar: PanelContainer
+var edit_list: VBoxContainer
+var edit_hint: Label
+
+# layout (rebuilt from GS.placed)
+var furn_nodes: Array = []      # sprites of placed items
+var occupied := {}              # Vector2i -> index into GS.placed (solid items)
+var rug_at := {}                # Vector2i -> index into GS.placed (rugs)
+var seats: Array = []           # {tile, dir, table, taken, dirty, plate, cleaning}
+var stations := {}              # kind -> Array[Vector2i]
+var station_busy := {}          # Vector2i -> staff key
+var counter_dishes := {}        # counter tile -> Array[Sprite2D]
+
 var customers: Array = []
 var orders: Array = []
 var staff_actors := {}
 var stamina := {}               # key -> current stamina
 var tired := {}                 # key -> bool
 var working := {}               # key -> bool (doing a task)
+var dirty_dishes := 0           # plates waiting at the sink
 var spawn_t := 3.0
 var save_t := 0.0
 var customer_sheets: Array[Texture2D] = []
 var theme_ui: Theme
 
+# day cycle: "open" -> "closing" -> "night"
+var phase := "open"
+var day_t := 0.0
+
+# edit mode
+var editing := false
+var held: Dictionary = {}       # {item, rot, from: Vector2i or null}
+var ghost: Sprite2D
+var grid_node: GridNode
+var hover := Vector2i(-1, -1)
+
 
 # ------------------------------------------------------------------ setup
 func _ready() -> void:
 	randomize()
+	tint = CanvasModulate.new()
+	add_child(tint)
 	_build_background()
 	_build_floor()
+	rug_layer = Node2D.new()
+	rug_layer.z_index = -9
+	add_child(rug_layer)
 	world = Node2D.new()
 	world.y_sort_enabled = true
 	add_child(world)
 	fx = Node2D.new()
 	fx.z_index = 50
 	add_child(fx)
-	_setup_grid()
-	_build_furniture()
+	grid_node = GridNode.new()
+	grid_node.main = self
+	grid_node.z_index = -8
+	grid_node.visible = false
+	add_child(grid_node)
+	ghost = Sprite2D.new()
+	ghost.centered = false
+	ghost.z_index = 60
+	ghost.visible = false
+	add_child(ghost)
+	astar.region = Rect2i(0, 0, COLS, ROWS)
+	astar.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
+	astar.update()
+	_apply_layout()
 	_load_customer_sheets()
 	_build_ui()
 	for key in GS.staff:
 		_spawn_staff(key)
 	GS.changed.connect(_refresh_hud)
 	_refresh_hud()
-	_toast("Welcome to the Midnight Voyage Café!")
-	# `godot -- --demo-staff` / `--demo-menu` open a panel (screenshots/tests)
-	if "--demo-staff" in OS.get_cmdline_user_args():
+	_toast("Day %d - the café is open!" % GS.day)
+	var args := OS.get_cmdline_user_args()
+	# `godot -- --demo-staff` / `--demo-menu` / `--demo-night` / `--demo-shop` (screenshots/tests)
+	if "--demo-night" in args:
+		day_t = GS.DAY_LENGTH
+	if "--demo-edit" in args:  # night, then pick up / rotate / re-place a chair and the stove
+		phase = "closing"
+		await get_tree().create_timer(1.0).timeout
+		_set_editing(true)
+		hover = Vector2i(2, 2)
+		_pick_up(Vector2i(2, 2))
+		_rotate_held()
+		_rotate_held()
+		_place(Vector2i(2, 2))
+		_pick_up(Vector2i(0, 1))
+		_rotate_held()
+		_update_ghost()
+		await get_tree().create_timer(1.0).timeout
+		_place(Vector2i(0, 1))
+	if "--demo-staff" in args:
 		await get_tree().create_timer(3.0).timeout
 		_open_staff()
-	if "--demo-menu" in OS.get_cmdline_user_args():
+	if "--demo-menu" in args:
 		await get_tree().create_timer(1.0).timeout
 		_open_menu()
+	if "--demo-shop" in args:
+		await get_tree().create_timer(1.0).timeout
+		_open_shop()
 	# `godot -- --demo-summon` showcases a 10-pull (used for screenshots/tests)
-	if "--demo-summon" in OS.get_cmdline_user_args():
+	if "--demo-summon" in args:
 		await get_tree().create_timer(1.0).timeout
 		GS.gems += GS.PULL10_COST
 		_open_summon()
@@ -100,12 +162,15 @@ func tile_pos(t: Vector2i) -> Vector2:
 	return ORIGIN + Vector2((t.x - t.y) * HW, (t.x + t.y) * HH + HH)
 
 
-func _setup_grid() -> void:
-	astar.region = Rect2i(0, 0, COLS, ROWS)
-	astar.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
-	astar.update()
-	for t in [STOVE, COUNTER, DISPLAY, PLANT]:
-		astar.set_point_solid(t, true)
+func pos_tile(p: Vector2) -> Vector2i:
+	var q := p - ORIGIN - Vector2(0, HH)
+	var a := q.x / HW
+	var b := q.y / HH
+	return Vector2i(roundi((a + b) / 2.0), roundi((b - a) / 2.0))
+
+
+func in_room(t: Vector2i) -> bool:
+	return t.x >= 0 and t.y >= 0 and t.x < COLS and t.y < ROWS
 
 
 func _build_background() -> void:
@@ -163,46 +228,168 @@ func _build_floor() -> void:
 			add_child(s)
 
 
-func _prop(path: String, t: Vector2i, foot: float = 12.0, flip: bool = false, shift: Vector2 = Vector2.ZERO) -> Sprite2D:
-	var tx := tex(path)
+# ------------------------------------------------------------------ layout
+func _kind(item: String) -> String:
+	return GS.ITEMS[item]["kind"]
+
+
+## Texture + mirror flag for an item at a rotation.
+func _item_look(item: String, rot: int) -> Array:
+	if rot >= 2:
+		var back := tex(GS.item_tex_path(item).replace(".png", "_back.png"))
+		if back:
+			# back art faces NW; "back_flip" items were drawn facing NE instead
+			return [back, (rot == 3) != bool(GS.ITEMS[item].get("back_flip", false))]
+	return [tex(GS.item_tex_path(item)), rot % 2 == 1]
+
+
+func _rotations(item: String) -> int:
+	return 4 if ResourceLoader.exists(GS.item_tex_path(item).replace(".png", "_back.png")) else 2
+
+
+func _make_sprite(item: String, rot: int, t: Vector2i) -> Sprite2D:
+	var look := _item_look(item, rot)
+	var tx: Texture2D = look[0]
 	var s := Sprite2D.new()
 	s.texture = tx
+	s.flip_h = look[1]
 	s.centered = false
-	s.flip_h = flip
 	if tx:
-		s.offset = Vector2(-tx.get_width() / 2.0, -tx.get_height() + foot).floor() + shift
+		# base of the art sits on the tile's lower vertex area
+		var foot := 6.0 if _kind(item) == "rug" else 12.0
+		s.offset = Vector2(-tx.get_width() / 2.0, -tx.get_height() + foot).floor()
 	s.position = tile_pos(t)
-	world.add_child(s)
 	return s
 
 
-func _build_furniture() -> void:
-	_prop("res://assets/cafe/stove.png", STOVE, 12, false)
-	_prop("res://assets/cafe/counter.png", COUNTER, 14, true)
-	_prop("res://assets/cafe/display.png", DISPLAY, 12, true)
-	_prop("res://assets/cafe/plant.png", PLANT, 10)
-	for i in TABLES.size():
-		var t: Vector2i = TABLES[i]
-		var entry := {"tile": t, "chairs": [], "node": null, "plates": []}
-		entry["chairs"] = [
-			{"tile": t + Vector2i(-1, 0), "dir": Actor.Dir.SE, "taken": false, "node": null},
-			{"tile": t + Vector2i(0, -1), "dir": Actor.Dir.SW, "taken": false, "node": null},
-		]
-		tables.append(entry)
-	_refresh_tables()
+## Rebuild sprites, path grid, seats and stations from GS.placed.
+func _apply_layout() -> void:
+	for n in furn_nodes:
+		n.queue_free()
+	furn_nodes.clear()
+	occupied.clear()
+	rug_at.clear()
+	stations.clear()
+	astar.fill_solid_region(astar.region, false)
+	for i in GS.placed.size():
+		var p: Dictionary = GS.placed[i]
+		var t := Vector2i(p["c"], p["r"])
+		var s := _make_sprite(p["item"], p["rot"], t)
+		if _kind(p["item"]) == "rug":
+			rug_layer.add_child(s)
+			rug_at[t] = i
+		else:
+			world.add_child(s)
+			occupied[t] = i
+			astar.set_point_solid(t, true)
+			var k := _kind(p["item"])
+			if not stations.has(k):
+				stations[k] = []
+			stations[k].append(t)
+		furn_nodes.append(s)
+	# a chair is a seat when it faces a table
+	var old := {}
+	for s in seats:
+		old[s["tile"]] = s
+	seats.clear()
+	for t in occupied:
+		var p: Dictionary = GS.placed[occupied[t]]
+		if _kind(p["item"]) != "chair":
+			continue
+		var facing: Vector2i = t + ROT_DIRS[p["rot"]]
+		if occupied.has(facing) and _kind(GS.placed[occupied[facing]]["item"]) == "table":
+			var seat := {"tile": t, "dir": p["rot"], "table": facing, "taken": false, "dirty": false,
+				"plate": null, "cleaning": false}
+			if old.has(t) and old[t]["table"] == facing:
+				seat = old[t]
+			seats.append(seat)
+	for t in counter_dishes.keys():
+		if not occupied.has(t):
+			for d in counter_dishes[t]:
+				d.queue_free()
+			counter_dishes.erase(t)
+	if grid_node:
+		grid_node.queue_redraw()
 
 
-func _refresh_tables() -> void:
-	for i in tables.size():
-		var e: Dictionary = tables[i]
-		var owned := i < GS.tables_owned
-		if owned and e["node"] == null:
-			e["node"] = _prop("res://assets/cafe/table.png", e["tile"], 11)
-			astar.set_point_solid(e["tile"], true)
-			for ch in e["chairs"]:
-				var img := "res://assets/cafe/chair_se.png" if ch["dir"] == Actor.Dir.SE else "res://assets/cafe/chair_sw.png"
-				ch["node"] = _prop(img, ch["tile"], 10)
-				astar.set_point_solid(ch["tile"], true)
+func _station_list(kind: String) -> Array:
+	return stations.get(kind, [])
+
+
+## Where to stand to use a station: its front tile if free, else any free side.
+func work_tile(st: Vector2i) -> Vector2i:
+	var p: Dictionary = GS.placed[occupied[st]]
+	var order: Array[Vector2i] = [ROT_DIRS[p["rot"]]]
+	for d in ROT_DIRS:
+		if d != order[0]:
+			order.append(d)
+	for d in order:
+		var n: Vector2i = st + d
+		if in_room(n) and not astar.is_point_solid(n):
+			return n
+	return st
+
+
+func _nearest_station(kind: String, from: Vector2i, need_free: bool, key: String = "") -> Vector2i:
+	var best := Vector2i(-1, -1)
+	var best_d := 1 << 30
+	for st in _station_list(kind):
+		if need_free and station_busy.has(st) and station_busy[st] != key:
+			continue
+		var d: int = absi(st.x - from.x) + absi(st.y - from.y)
+		if d < best_d:
+			best_d = d
+			best = st
+	return best
+
+
+## Free tile closest to `want` (staff idle spots may get covered by furniture).
+func free_spot(want: Vector2i) -> Vector2i:
+	if in_room(want) and not astar.is_point_solid(want) and want != DOOR:
+		return want
+	var best := want
+	var best_d := 1 << 30
+	for c in COLS:
+		for r in ROWS:
+			var t := Vector2i(c, r)
+			if astar.is_point_solid(t) or t == DOOR:
+				continue
+			var d: int = absi(c - want.x) + absi(r - want.y)
+			if d < best_d:
+				best_d = d
+				best = t
+	return best
+
+
+## Every solid item must keep a walkable side reachable from the door
+## (tables are exempt: they are reached through the chairs around them).
+func layout_ok(extra_solid: Vector2i = Vector2i(-1, -1)) -> bool:
+	var solid := func(t: Vector2i) -> bool:
+		return t == extra_solid or occupied.has(t)
+	var seen := {DOOR: true}
+	var queue: Array[Vector2i] = [DOOR]
+	while not queue.is_empty():
+		var t: Vector2i = queue.pop_front()
+		for d in ROT_DIRS:
+			var n: Vector2i = t + d
+			if in_room(n) and not seen.has(n) and not solid.call(n):
+				seen[n] = true
+				queue.append(n)
+	var check: Array = []
+	for t in occupied:
+		if _kind(GS.placed[occupied[t]]["item"]) != "table":
+			check.append(t)
+	if in_room(extra_solid) and not (held.size() > 0 and _kind(held["item"]) == "table"):
+		check.append(extra_solid)
+	for t in check:
+		var ok := false
+		for d in ROT_DIRS:
+			if seen.has(t + d):
+				ok = true
+				break
+		if not ok:
+			return false
+	return true
 
 
 func _load_customer_sheets() -> void:
@@ -267,7 +454,7 @@ func _spawn_staff(key: String) -> void:
 	if staff_actors.has(key) or not GS.sheet_exists(key):
 		return
 	var sheet := tex("res://assets/chars/%s.png" % GS.STAFF[key]["sheet"])
-	var a := make_actor(sheet, 4, REST_SPOT)
+	var a := make_actor(sheet, 4, free_spot(REST_SPOT))
 	staff_actors[key] = a
 	stamina[key] = GS.max_stamina(key)
 	_update_speed(key)
@@ -316,13 +503,11 @@ func _pick_task(key: String) -> Dictionary:
 			greet = c
 			break
 	var dirty: Dictionary = {}
-	for i in GS.tables_owned:
-		for ch in tables[i]["chairs"]:
-			if ch.get("dirty", false) and not ch.get("cleaning", false):
-				dirty = ch
-				break
-		if not dirty.is_empty():
+	for seat in seats:
+		if seat["dirty"] and not seat["cleaning"]:
+			dirty = seat
 			break
+	var wash := dirty_dishes > 0 and not _station_list("sink").is_empty() and not _anyone_washing()
 	var no_chef := not _has_role("Chef")
 	var no_barista := not _has_role("Barista")
 	var no_waiter := not _has_role("Waiter")
@@ -347,7 +532,9 @@ func _pick_task(key: String) -> Dictionary:
 			if not ready.is_empty():
 				return {"type": "deliver", "order": ready}
 			if no_cleaner and not dirty.is_empty():
-				return {"type": "clean", "chair": dirty}
+				return {"type": "clean", "seat": dirty}
+			if no_cleaner and wash:
+				return {"type": "wash"}
 			if no_chef and no_barista and not cook_any.is_empty():
 				return {"type": "cook", "order": cook_any}
 		"Hostess":
@@ -357,10 +544,19 @@ func _pick_task(key: String) -> Dictionary:
 				return {"type": "deliver", "order": ready}
 		"Cleaner":
 			if not dirty.is_empty():
-				return {"type": "clean", "chair": dirty}
+				return {"type": "clean", "seat": dirty}
+			if wash:
+				return {"type": "wash"}
 			if no_waiter and not ready.is_empty():
 				return {"type": "deliver", "order": ready}
 	return {}
+
+
+func _anyone_washing() -> bool:
+	for st in _station_list("sink"):
+		if station_busy.has(st):
+			return true
+	return false
 
 
 func _staff_loop(key: String) -> void:
@@ -368,9 +564,10 @@ func _staff_loop(key: String) -> void:
 	while is_instance_valid(a):
 		var task: Dictionary = {} if is_tired(key) else _pick_task(key)
 		if task.is_empty():
-			var idle: Vector2i = IDLE_SPOTS.get(_role(key), REST_SPOT)
-			if is_tired(key):
-				idle = REST_SPOT
+			var want: Vector2i = IDLE_SPOTS.get(_role(key), REST_SPOT)
+			if is_tired(key) or phase == "night":
+				want = REST_SPOT + Vector2i(staff_actors.keys().find(key) % 3, 0)
+			var idle := free_spot(want)
 			if a.tile != idle:
 				await walk(a, idle)
 				a.face(Actor.Dir.SE)
@@ -385,7 +582,9 @@ func _staff_loop(key: String) -> void:
 			"greet":
 				await _do_greet(key, a, task["customer"])
 			"clean":
-				await _do_clean(key, a, task["chair"])
+				await _do_clean(key, a, task["seat"])
+			"wash":
+				await _do_wash(key, a)
 		working[key] = false
 
 
@@ -399,7 +598,7 @@ func _tick_stamina(delta: float) -> void:
 		if working.get(key, false):
 			s -= GS.stamina_drain(key) * delta
 		else:
-			s += (6.0 if _role(key) == "Rest" or is_tired(key) else 2.5) * delta
+			s += (6.0 if _role(key) == "Rest" or is_tired(key) or phase == "night" else 2.5) * delta
 		s = clampf(s, 0.0, mx)
 		stamina[key] = s
 		var was := is_tired(key)
@@ -431,22 +630,34 @@ func _star(tier: String) -> Sprite2D:
 
 
 func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
-	o["state"] = "cooking"
 	var drink: bool = o["food"] in GS.DRINKS
-	# baristas brew at the counter, everyone else cooks at the stove
-	var at_counter := drink and _role(key) == "Barista"
-	await walk(a, PICKUP if at_counter else COOK_SPOT)
-	a.face_tile(COUNTER if at_counter else STOVE)
-	var dur: float = GS.FOODS[o["food"]]["cook"] / GS.agi_mult(key) / (0.6 if is_tired(key) else 1.0)
+	# baristas brew at an espresso machine (or a counter), everyone else at a stove
+	var kind := "espresso" if drink and _role(key) == "Barista" else "stove"
+	if kind == "espresso" and _station_list("espresso").is_empty():
+		kind = "counter"
+	var st := _nearest_station(kind, a.tile, true, key)
+	if st.x < 0:
+		await get_tree().create_timer(0.5).timeout  # every station busy: try again
+		return
+	o["state"] = "cooking"
+	station_busy[st] = key
+	await walk(a, work_tile(st))
+	a.face_tile(st)
+	var fridge := 1.1 if not _station_list("fridge").is_empty() else 1.0
+	var dur: float = GS.FOODS[o["food"]]["cook"] / GS.agi_mult(key) / fridge / (0.6 if is_tired(key) else 1.0)
 	await _work(a, dur, tex("res://assets/food/small/%s.png" % o["food"]), Color("f0a640"))
+	station_busy.erase(st)
 	if o["customer"]["state"] != "waiting":
 		orders.erase(o)
 		return
 	o["tier"] = GS.roll_quality(key, o["food"], _role(key), is_tired(key))
 	o["maker"] = key
-	if not at_counter:
-		await walk(a, PICKUP)
-		a.face_tile(COUNTER)
+	var counter := _nearest_station("counter", a.tile, false)
+	if counter.x < 0:
+		counter = st  # no counter: hand it over from the station itself
+	elif counter != st:
+		await walk(a, work_tile(counter))
+		a.face_tile(counter)
 	var dish := Sprite2D.new()
 	dish.texture = tex("res://assets/food/tiny/%s.png" % o["food"])
 	dish.z_index = 5
@@ -454,34 +665,39 @@ func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
 	badge.position = Vector2(6, -8)
 	dish.add_child(badge)
 	fx.add_child(dish)
-	counter_dishes.append(dish)
-	_relayout_counter()
+	if not counter_dishes.has(counter):
+		counter_dishes[counter] = []
+	counter_dishes[counter].append(dish)
+	_relayout_counter(counter)
 	o["dish"] = dish
+	o["counter"] = counter
 	o["state"] = "ready"
 
 
 func _do_deliver(key: String, a: Actor, o: Dictionary) -> void:
 	o["state"] = "delivering"
-	await walk(a, PICKUP)
-	a.face_tile(COUNTER)
+	var counter: Vector2i = o["counter"]
+	await walk(a, work_tile(counter))
+	a.face_tile(counter)
 	var dish: Sprite2D = o.get("dish")
 	if is_instance_valid(dish):
-		counter_dishes.erase(dish)
+		counter_dishes.get(counter, []).erase(dish)
 		dish.queue_free()
-	_relayout_counter()
+	_relayout_counter(counter)
 	var c: Dictionary = o["customer"]
 	if c["state"] != "waiting":
 		orders.erase(o)
 		return
 	a.carry.texture = tex("res://assets/food/tiny/%s.png" % o["food"])
+	a.carry.modulate = Color.WHITE
 	a.carry.visible = true
-	var chair: Dictionary = c["chair"]
-	await walk(a, free_neighbor(chair["tile"], a.tile))
+	var seat: Dictionary = c["seat"]
+	await walk(a, free_neighbor(seat["tile"], a.tile))
 	a.carry.visible = false
 	orders.erase(o)
 	if c["state"] != "waiting":
 		return
-	a.face_tile(chair["tile"])
+	a.face_tile(seat["tile"])
 	c["state"] = "served"
 	c["server"] = key
 	c["tier"] = o["tier"]
@@ -491,10 +707,10 @@ func _do_deliver(key: String, a: Actor, o: Dictionary) -> void:
 ## Hostess welcome: more patience (HOS + FOC) and a satisfaction bonus.
 func _do_greet(key: String, a: Actor, c: Dictionary) -> void:
 	c["greeting"] = true
-	await walk(a, free_neighbor(c["chair"]["tile"], a.tile))
+	await walk(a, free_neighbor(c["seat"]["tile"], a.tile))
 	if c["state"] != "waiting":
 		return
-	a.face_tile(c["chair"]["tile"])
+	a.face_tile(c["seat"]["tile"])
 	await _work(a, 1.2, tex("res://assets/gacha/sparkle.png"), Color("f08bd8"))
 	if c["state"] != "waiting":
 		return
@@ -505,68 +721,97 @@ func _do_greet(key: String, a: Actor, c: Dictionary) -> void:
 	c["satisfaction"] = 1.0 + (GS.stat(key, "hos") + GS.stat(key, "foc")) * 0.01
 
 
-## Clear a dirty seat. Cleaners (AGI + END) are faster than anyone covering.
-func _do_clean(key: String, a: Actor, chair: Dictionary) -> void:
-	chair["cleaning"] = true
-	await walk(a, free_neighbor(chair["tile"], a.tile))
-	a.face_tile(chair["tile"])
-	var skill := GS.agi_mult(key) * (0.7 + GS.stat(key, "end") * 0.03)
-	var dur := 3.0 / skill * (1.0 if _role(key) == "Cleaner" else 1.5) / (0.6 if is_tired(key) else 1.0)
-	await _work(a, dur, tex("res://assets/gacha/sparkle.png"), Color("8fd0f0"))
-	var plate: Node = chair.get("plate")
+## Bus a dirty seat: pick up the plate and carry it to the sink pile.
+func _do_clean(key: String, a: Actor, seat: Dictionary) -> void:
+	seat["cleaning"] = true
+	await walk(a, free_neighbor(seat["tile"], a.tile))
+	a.face_tile(seat["tile"])
+	await _work(a, 0.8 / GS.agi_mult(key), tex("res://assets/gacha/sparkle.png"), Color("8fd0f0"))
+	var plate: Sprite2D = seat.get("plate")
 	if is_instance_valid(plate):
+		a.carry.texture = plate.texture
+		a.carry.modulate = plate.modulate
+		a.carry.visible = true
 		plate.queue_free()
-	chair["dirty"] = false
-	chair["cleaning"] = false
+	seat["plate"] = null
+	seat["dirty"] = false
+	seat["cleaning"] = false
+	var sink := _nearest_station("sink", a.tile, false)
+	if sink.x >= 0:
+		await walk(a, work_tile(sink))
+		a.face_tile(sink)
+		dirty_dishes += 1
+	a.carry.visible = false
 
 
-func _relayout_counter() -> void:
-	for i in counter_dishes.size():
-		counter_dishes[i].position = tile_pos(COUNTER) + Vector2(-6 + i * 8, -30)
+## Wash the dish pile at a sink. Speed: AGI + END, cleaners and drying racks help.
+func _do_wash(key: String, a: Actor) -> void:
+	var sink := _nearest_station("sink", a.tile, true, key)
+	if sink.x < 0:
+		return
+	station_busy[sink] = key
+	await walk(a, work_tile(sink))
+	a.face_tile(sink)
+	var racks := mini(_station_list("rack").size(), 2)
+	var skill := GS.agi_mult(key) * (0.7 + GS.stat(key, "end") * 0.03) * (1.0 + 0.3 * racks)
+	while dirty_dishes > 0 and not (is_tired(key) and _role(key) != "Cleaner"):
+		var dur := 2.2 / skill * (1.0 if _role(key) == "Cleaner" else 1.5) / (0.6 if is_tired(key) else 1.0)
+		await _work(a, dur, tex("res://assets/food/tiny/coffee.png"), Color("8fd0f0"))
+		dirty_dishes -= 1
+		if _role(key) != "Cleaner":
+			break  # helpers wash one and go back to their own job
+	station_busy.erase(sink)
+
+
+func _relayout_counter(counter: Vector2i) -> void:
+	var list: Array = counter_dishes.get(counter, [])
+	for i in list.size():
+		list[i].position = tile_pos(counter) + Vector2(-8 + (i % 3) * 8, -30 - (i / 3) * 6)
 
 
 # ------------------------------------------------------------------ customers
-func _free_chairs() -> Array:
+func _free_seats() -> Array:
 	var out: Array = []
-	for i in GS.tables_owned:
-		for ch in tables[i]["chairs"]:
-			if not ch["taken"] and not ch.get("dirty", false):
-				out.append({"table": tables[i], "chair": ch})
+	for seat in seats:
+		if not seat["taken"] and not seat["dirty"]:
+			out.append(seat)
 	return out
 
 
 func _spawn_customer() -> void:
-	var free := _free_chairs()
+	var free := _free_seats()
 	if free.is_empty():
 		return
-	var pick: Dictionary = free[randi() % free.size()]
-	var chair: Dictionary = pick["chair"]
-	chair["taken"] = true
+	var seat: Dictionary = free[randi() % free.size()]
+	seat["taken"] = true
 	var a: Actor
+	var idx := randi() % maxi(customer_sheets.size(), 1)
 	if customer_sheets.is_empty():
 		a = make_actor(tex("res://assets/chars/chef.png"), 4, DOOR)
 		a.modulate = Color.from_hsv(randf(), 0.35, 1.0)
 	else:
-		a = make_actor(customer_sheets[randi() % customer_sheets.size()], 2, DOOR)
+		a = make_actor(customer_sheets[idx], 2, DOOR)
+		a.sit_tex = tex("res://assets/chars/customer_%d_sit.png" % idx)
 	a.speed = 36.0
-	var c := {"actor": a, "chair": chair, "table": pick["table"], "state": "walking",
-		"patience": 45.0, "max_patience": 45.0, "satisfaction": 1.0}
+	var patience := 45.0 * (1.0 + GS.ambience() * 0.02)
+	var c := {"actor": a, "seat": seat, "state": "walking", "patience": patience,
+		"max_patience": patience, "satisfaction": 1.0}
 	customers.append(c)
 	_customer_flow(c)
 
 
-func _plate_pos(c: Dictionary) -> Vector2:
-	var side := -9.0 if c["chair"]["dir"] == Actor.Dir.SE else 9.0
-	return tile_pos(c["table"]["tile"]) + Vector2(side, -24)
+func _plate_pos(seat: Dictionary) -> Vector2:
+	var table := tile_pos(seat["table"])
+	return table + (tile_pos(seat["tile"]) - table) * 0.25 + Vector2(0, -24)
 
 
 func _customer_flow(c: Dictionary) -> void:
 	var a: Actor = c["actor"]
+	var seat: Dictionary = c["seat"]
 	a.modulate.a = 0.0
 	create_tween().tween_property(a, "modulate:a", 1.0, 0.4)
-	await walk(a, c["chair"]["tile"])
-	a.position += Vector2(0, -3)
-	a.face(c["chair"]["dir"])
+	await walk(a, seat["tile"])
+	a.sit([Actor.Dir.SE, Actor.Dir.SW, Actor.Dir.NW, Actor.Dir.NE][seat["dir"]])
 	var menu: Array = GS.unlocked
 	var food: String = menu[randi() % menu.size()]
 	c["food"] = food
@@ -581,7 +826,7 @@ func _customer_flow(c: Dictionary) -> void:
 		var tier: String = c["tier"]
 		plate = Sprite2D.new()
 		plate.texture = tex("res://assets/food/tiny/%s.png" % food)
-		plate.position = _plate_pos(c)
+		plate.position = _plate_pos(seat)
 		plate.z_index = 5
 		fx.add_child(plate)
 		var badge := _star(tier)
@@ -592,12 +837,12 @@ func _customer_flow(c: Dictionary) -> void:
 		_pay(c, food, tier)
 	else:
 		_float_text(a.position + Vector2(0, -70), "Too slow...", Color("ff8a8a"))
-	a.position += Vector2(0, 3)
-	c["chair"]["taken"] = false
-	if plate:  # leftovers stay until someone cleans the seat
+	a.stand()
+	seat["taken"] = false
+	if plate:  # leftovers stay until someone buses the seat
 		plate.modulate = Color(0.55, 0.5, 0.5, 0.9)
-		c["chair"]["dirty"] = true
-		c["chair"]["plate"] = plate
+		seat["dirty"] = true
+		seat["plate"] = plate
 	await walk(a, DOOR)
 	var tw := create_tween()
 	tw.tween_property(a, "modulate:a", 0.0, 0.4)
@@ -611,7 +856,7 @@ func _pay(c: Dictionary, food: String, tier: String) -> void:
 	var a: Actor = c["actor"]
 	var price: int = GS.FOODS[food]["price"]
 	var sat: float = c.get("satisfaction", 1.0)
-	var tip_rate := GS.stat(c["server"], "hos") * 0.012
+	var tip_rate := GS.stat(c["server"], "hos") * 0.012 + GS.ambience() * 0.01
 	if food in GS.DRINKS and GS.staff.has(c["maker"]) and _role(c["maker"]) == "Barista":
 		tip_rate += GS.stat(c["maker"], "hos") * 0.006
 	var earned := int(round(price * GS.TIER_PRICE[tier] + (0.0 if tier == "black" else price * tip_rate * sat)))
@@ -634,11 +879,21 @@ func _pay(c: Dictionary, food: String, tier: String) -> void:
 		_float_text(a.position + Vector2(0, -84), "+10 gems", Color("f08bd8"))
 
 
+# ------------------------------------------------------------------ day cycle
 func _process(delta: float) -> void:
-	spawn_t -= delta
-	if spawn_t <= 0.0:
-		spawn_t = maxf(2.5, 8.0 - GS.rep_level * 0.4) + randf() * 3.0
-		_spawn_customer()
+	match phase:
+		"open":
+			day_t += delta
+			spawn_t -= delta
+			if spawn_t <= 0.0:
+				spawn_t = maxf(2.5, 8.0 - GS.rep_level * 0.4) + randf() * 3.0
+				_spawn_customer()
+			if day_t >= GS.DAY_LENGTH:
+				phase = "closing"
+				_toast("Closing time - finishing the last orders.")
+		"closing":
+			if customers.is_empty():
+				_start_night()
 	for c in customers:
 		if c["state"] == "waiting":
 			c["patience"] -= delta
@@ -647,10 +902,55 @@ func _process(delta: float) -> void:
 			if c["patience"] <= 0.0:
 				c["state"] = "angry"
 	_tick_stamina(delta)
+	_refresh_day_label()
 	save_t += delta
 	if save_t > 15.0:
 		save_t = 0.0
 		GS.save_game()
+
+
+func _start_night() -> void:
+	phase = "night"
+	orders.clear()
+	create_tween().tween_property(tint, "color", NIGHT_TINT, 1.5)
+	night_bar.visible = true
+	GS.save_game()
+	_toast("The café is closed. Rearrange furniture, then open for Day %d." % (GS.day + 1))
+
+
+func _open_cafe() -> void:
+	var missing: Array = []
+	for need in [["stove", "a stove"], ["counter", "a counter"]]:
+		if _station_list(need[0]).is_empty():
+			missing.append(need[1])
+	if seats.is_empty():
+		missing.append("a chair facing a table")
+	if not missing.is_empty():
+		_toast("Can't open yet - place " + ", ".join(missing) + ".")
+		return
+	if editing:
+		_set_editing(false)
+	GS.day += 1
+	day_t = 0.0
+	spawn_t = 2.0
+	phase = "open"
+	night_bar.visible = false
+	create_tween().tween_property(tint, "color", Color.WHITE, 1.5)
+	GS.save_game()
+	_toast("Day %d - the café is open!" % GS.day)
+
+
+func _refresh_day_label() -> void:
+	if hud_day == null:
+		return
+	match phase:
+		"open":
+			var left := int(ceil(GS.DAY_LENGTH - day_t))
+			hud_day.text = "Day %d  Open %d:%02d" % [GS.day, left / 60, left % 60]
+		"closing":
+			hud_day.text = "Day %d  Closing..." % GS.day
+		"night":
+			hud_day.text = "Day %d  Night" % GS.day
 
 
 func _notification(what: int) -> void:
@@ -731,6 +1031,9 @@ func _build_ui() -> void:
 	hud_bar.show_percentage = false
 	rep.add_child(hud_bar)
 	hb.add_child(rep)
+	hud_day = Label.new()
+	hud_day.add_theme_font_size_override("font_size", 11)
+	hb.add_child(hud_day)
 
 	# side buttons
 	var side := VBoxContainer.new()
@@ -749,6 +1052,46 @@ func _build_ui() -> void:
 	toast_box.custom_minimum_size = Vector2(194, 0)
 	toast_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(toast_box)
+
+	# night controls
+	night_bar = VBoxContainer.new()
+	night_bar.position = Vector2(6, 172)
+	night_bar.add_theme_constant_override("separation", 8)
+	night_bar.visible = false
+	root.add_child(night_bar)
+	var eb := Button.new()
+	eb.text = "Edit Café"
+	eb.custom_minimum_size = Vector2(80, 26)
+	eb.pressed.connect(func(): _set_editing(not editing))
+	night_bar.add_child(eb)
+	var ob := Button.new()
+	ob.text = "Open Café"
+	ob.custom_minimum_size = Vector2(80, 26)
+	ob.pressed.connect(_open_cafe)
+	night_bar.add_child(ob)
+
+	# edit mode: storage strip + hint
+	edit_bar = PanelContainer.new()
+	edit_bar.position = Vector2(570, 48)
+	edit_bar.custom_minimum_size = Vector2(64, 270)
+	edit_bar.size = Vector2(64, 270)
+	edit_bar.visible = false
+	root.add_child(edit_bar)
+	var esc := ScrollContainer.new()
+	esc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	edit_bar.add_child(esc)
+	edit_list = VBoxContainer.new()
+	edit_list.add_theme_constant_override("separation", 4)
+	esc.add_child(edit_list)
+	edit_hint = Label.new()
+	edit_hint.position = Vector2(96, 342)
+	edit_hint.add_theme_font_size_override("font_size", 10)
+	edit_hint.add_theme_color_override("font_color", Color("fff6ea"))
+	edit_hint.add_theme_color_override("font_outline_color", Color("2a1a22"))
+	edit_hint.add_theme_constant_override("outline_size", 4)
+	edit_hint.text = "Click: pick up / place    Right-click or R: rotate    Del: put away    Esc: cancel"
+	edit_hint.visible = false
+	root.add_child(edit_hint)
 
 	overlay = Control.new()
 	overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -899,9 +1242,14 @@ func _open_menu() -> void:
 
 
 # ---- staff
-func _portrait(key: String) -> TextureRect:
+## Standing frame of a character. combat = the outside/battle outfit
+## (assets/chars/<sheet>_combat.png), used by the gacha; falls back to café clothes.
+func _portrait(key: String, combat: bool = false) -> TextureRect:
 	var at := AtlasTexture.new()
-	at.atlas = tex("res://assets/chars/%s.png" % GS.STAFF[key]["sheet"])
+	var sheet: String = GS.STAFF[key]["sheet"]
+	at.atlas = tex("res://assets/chars/%s.png" % sheet)
+	if combat and ResourceLoader.exists("res://assets/chars/%s_combat.png" % sheet):
+		at.atlas = tex("res://assets/chars/%s_combat.png" % sheet)
 	var fw := at.atlas.get_width() / 3.0
 	var fh := at.atlas.get_height() / 4.0
 	at.region = Rect2(fw, 0, fw, fh)
@@ -992,7 +1340,7 @@ func _open_summon() -> void:
 	var featured := HBoxContainer.new()
 	for k in GS.STAFF:
 		if GS.STAFF[k]["rarity"] == "SSR" and GS.sheet_exists(k):
-			featured.add_child(_portrait(k))
+			featured.add_child(_portrait(k, true))
 	info.add_child(featured)
 	info.add_child(_small_label("You have %d gems" % GS.gems, 11))
 	var b1 := Button.new()
@@ -1083,7 +1431,7 @@ func _show_results(results: Array) -> void:
 		var cv := VBoxContainer.new()
 		cv.add_theme_constant_override("separation", 1)
 		card.add_child(cv)
-		var pr := _portrait(r["key"])
+		var pr := _portrait(r["key"], true)
 		pr.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		cv.add_child(pr)
 		var nl := _small_label("%s %s" % [d["rarity"], d["name"]], 9)
@@ -1110,29 +1458,227 @@ func _show_results(results: Array) -> void:
 
 # ---- shop
 func _open_shop() -> void:
-	var v := _open_panel("Shop", Vector2(320, 200))
-	if GS.tables_owned < GS.TABLE_COSTS.size():
-		var cost: int = GS.TABLE_COSTS[GS.tables_owned]
-		var b := Button.new()
-		b.text = "Add a table (2 seats)  -  %d coins" % cost
-		b.disabled = GS.coins < cost
-		b.pressed.connect(func():
-			if GS.buy_table():
-				_refresh_tables()
-				_toast("New table placed!")
-			_open_shop())
-		v.add_child(b)
-	else:
-		v.add_child(_small_label("All tables placed.", 11))
+	var list := _scroll(_open_panel("Furniture Shop", Vector2(460, 300)))
+	var top := HBoxContainer.new()
+	top.add_theme_constant_override("separation", 8)
 	var g := Button.new()
-	g.text = "Trade %d coins  ->  %d gems" % [GS.GEM_TRADE["coins"], GS.GEM_TRADE["gems"]]
+	g.text = "Trade %d coins -> %d gems" % [GS.GEM_TRADE["coins"], GS.GEM_TRADE["gems"]]
 	g.disabled = GS.coins < GS.GEM_TRADE["coins"]
 	g.pressed.connect(func():
 		if GS.trade_gems():
 			_toast("Gems acquired!")
 		_open_shop())
-	v.add_child(g)
-	v.add_child(_small_label("Reaching a new Café Lv gives +50 gems.", 10))
+	top.add_child(g)
+	top.add_child(_small_label("Bought items go to storage.\nPlace them at night with Edit Café.", 9))
+	list.add_child(top)
+	var grid := GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 6)
+	grid.add_theme_constant_override("v_separation", 6)
+	list.add_child(grid)
+	for item in GS.ITEMS:
+		var d: Dictionary = GS.ITEMS[item]
+		var cell := PanelContainer.new()
+		cell.add_theme_stylebox_override("panel", _sb(Color("fff6ea"), C_EDGE, 1, 4))
+		cell.custom_minimum_size = Vector2(138, 0)
+		var v := VBoxContainer.new()
+		v.add_theme_constant_override("separation", 2)
+		cell.add_child(v)
+		var icon := TextureRect.new()
+		icon.texture = tex(GS.item_tex_path(item))
+		icon.custom_minimum_size = Vector2(130, 70)
+		icon.stretch_mode = TextureRect.STRETCH_KEEP_CENTERED
+		v.add_child(icon)
+		v.add_child(_small_label(d["name"], 11))
+		v.add_child(_small_label(_item_blurb(item), 8))
+		var owned := int(GS.inventory.get(item, 0))
+		var b := Button.new()
+		b.text = "Buy  %d" % d["cost"] + ("   (stored %d)" % owned if owned > 0 else "")
+		b.add_theme_font_size_override("font_size", 9)
+		b.disabled = GS.coins < d["cost"]
+		b.pressed.connect(func():
+			if GS.buy_item(item):
+				_toast("%s bought - place it at night." % d["name"])
+				if editing:
+					_refresh_edit_list()
+			_open_shop())
+		v.add_child(b)
+		grid.add_child(cell)
+
+
+func _item_blurb(item: String) -> String:
+	match _kind(item):
+		"stove": return "Chefs cook here"
+		"espresso": return "Baristas brew drinks"
+		"counter": return "Finished dishes wait here"
+		"sink": return "Dirty dishes are washed"
+		"rack": return "Washing +30%"
+		"fridge": return "Cooking +10%"
+		"table": return "Chairs facing it = seats"
+		"chair": return "Face it toward a table"
+		"rug": return "Walkable, ambience +1"
+	return "Ambience +%d" % int(GS.ITEMS[item].get("ambience", 0))
+
+
+# ---- edit mode (night only)
+func _set_editing(on: bool) -> void:
+	if on and phase != "night":
+		_toast("You can rearrange once the café closes for the night.")
+		return
+	if not on and not held.is_empty():
+		_cancel_held()
+	editing = on
+	edit_bar.visible = on
+	edit_hint.visible = on
+	grid_node.visible = on
+	ghost.visible = false
+	if on:
+		_close_panel()
+		_refresh_edit_list()
+
+
+func _refresh_edit_list() -> void:
+	for ch in edit_list.get_children():
+		ch.queue_free()
+	if GS.inventory.is_empty():
+		var empty := _small_label("Storage empty.
+Buy items in the Shop.", 9)
+		empty.autowrap_mode = TextServer.AUTOWRAP_WORD
+		empty.custom_minimum_size = Vector2(52, 0)
+		edit_list.add_child(empty)
+	for item in GS.inventory:
+		var b := Button.new()
+		b.icon = tex(GS.item_tex_path(item))
+		b.expand_icon = true
+		b.custom_minimum_size = Vector2(52, 44)
+		b.text = "x%d" % GS.inventory[item]
+		b.add_theme_font_size_override("font_size", 9)
+		b.tooltip_text = GS.ITEMS[item]["name"]
+		b.pressed.connect(func():
+			if not held.is_empty():
+				_cancel_held()
+			if GS.take_from_inventory(item):
+				held = {"item": item, "rot": 0, "from": null}
+				_refresh_edit_list()
+				_update_ghost())
+		edit_list.add_child(b)
+
+
+func _pick_up(t: Vector2i) -> void:
+	var idx: int = occupied.get(t, rug_at.get(t, -1))
+	if idx < 0:
+		return
+	var p: Dictionary = GS.placed[idx]
+	for seat in seats:
+		if (seat["tile"] == t or seat["table"] == t) and seat["dirty"]:
+			_toast("Clear the dirty dishes there first.")
+			return
+	held = {"item": p["item"], "rot": p["rot"], "from": t}
+	GS.placed.remove_at(idx)
+	_apply_layout()
+	_update_ghost()
+
+
+func _can_place(t: Vector2i) -> bool:
+	if held.is_empty() or not in_room(t) or t == DOOR:
+		return false
+	if _kind(held["item"]) == "rug":
+		return not rug_at.has(t)
+	if occupied.has(t):
+		return false
+	return layout_ok(t)
+
+
+func _place(t: Vector2i) -> void:
+	if not _can_place(t):
+		var free := in_room(t) and not occupied.has(t) and t != DOOR
+		_toast("Can't place there - it would block a path." if free else "That spot is taken.")
+		return
+	GS.placed.append({"item": held["item"], "c": t.x, "r": t.y, "rot": held["rot"]})
+	held = {}
+	ghost.visible = false
+	_apply_layout()
+	GS.save_game()
+
+
+## Put the held item back where it came from (or into storage).
+func _cancel_held() -> void:
+	if held.is_empty():
+		return
+	if held["from"] != null:
+		var t: Vector2i = held["from"]
+		GS.placed.append({"item": held["item"], "c": t.x, "r": t.y, "rot": held["rot"]})
+		_apply_layout()
+	else:
+		GS.store_item(held["item"])
+		_refresh_edit_list()
+	held = {}
+	ghost.visible = false
+
+
+func _store_held() -> void:
+	if held.is_empty():
+		return
+	GS.store_item(held["item"])
+	held = {}
+	ghost.visible = false
+	_refresh_edit_list()
+	GS.save_game()
+
+
+func _rotate_held() -> void:
+	if held.is_empty():
+		return
+	held["rot"] = (int(held["rot"]) + 1) % _rotations(held["item"])
+	_update_ghost()
+
+
+func _update_ghost() -> void:
+	if held.is_empty():
+		ghost.visible = false
+		return
+	var s := _make_sprite(held["item"], held["rot"], hover if in_room(hover) else Vector2i(3, 3))
+	ghost.texture = s.texture
+	ghost.flip_h = s.flip_h
+	ghost.offset = s.offset
+	ghost.position = s.position
+	s.free()
+	ghost.visible = true
+	ghost.modulate = Color(0.6, 1, 0.6, 0.8) if _can_place(hover) else Color(1, 0.5, 0.5, 0.7)
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if not editing or overlay.visible:
+		return
+	if event is InputEventMouseMotion:
+		var t := pos_tile(get_global_mouse_position())
+		if t != hover:
+			hover = t
+			grid_node.queue_redraw()
+			_update_ghost()
+	elif event is InputEventMouseButton and event.pressed:
+		var t := pos_tile(get_global_mouse_position())
+		if event.button_index == MOUSE_BUTTON_LEFT:
+			if held.is_empty():
+				_pick_up(t)
+			else:
+				_place(t)
+		elif event.button_index == MOUSE_BUTTON_RIGHT:
+			if held.is_empty() and occupied.has(t):
+				var p: Dictionary = GS.placed[occupied[t]]  # rotate in place
+				p["rot"] = (int(p["rot"]) + 1) % _rotations(p["item"])
+				_apply_layout()
+				GS.save_game()
+			else:
+				_rotate_held()
+	elif event is InputEventKey and event.pressed:
+		match event.keycode:
+			KEY_R:
+				_rotate_held()
+			KEY_DELETE, KEY_BACKSPACE:
+				_store_held()
+			KEY_ESCAPE:
+				_cancel_held()
 
 
 # ------------------------------------------------------------------ drawing helpers
@@ -1178,3 +1724,22 @@ class WallNode extends Node2D:
 		draw_line(a + wain, b + wain, wood_dk, 2)
 		draw_line(a + up, b + up, Color("6b4630"), 3)
 		draw_line(a + up + Vector2(0, 3), b + up + Vector2(0, 3), Color("c99572"), 1)
+
+
+## Tile outlines shown while editing; the hovered tile is highlighted.
+class GridNode extends Node2D:
+	var main: Node2D
+
+	func _draw() -> void:
+		for c in main.COLS:
+			for r in main.ROWS:
+				var t := Vector2i(c, r)
+				var p: Vector2 = main.tile_pos(t)
+				var pts := PackedVector2Array([p + Vector2(0, -main.HH), p + Vector2(main.HW, 0),
+					p + Vector2(0, main.HH), p + Vector2(-main.HW, 0), p + Vector2(0, -main.HH)])
+				var col := Color(1, 1, 1, 0.18)
+				if t == main.hover:
+					col = Color(1, 0.95, 0.6, 0.9)
+				if t == main.DOOR:
+					col = Color(1, 0.5, 0.5, 0.4)
+				draw_polyline(pts, col, 1.0)

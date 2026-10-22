@@ -55,6 +55,47 @@ func face(d: int) -> void:
 	_set_frame(1)
 
 
+## Sitting pose. sit_tex is a single SW-facing sitting frame (mirrored for SE);
+## without it (or facing away) the standing frame is lifted onto the seat.
+var sit_tex: Texture2D
+var _stand_tex: Texture2D
+var _stand_frames := Vector2i.ZERO
+var _stand_offset := Vector2.ZERO
+var sitting := false
+
+
+func sit(d: int) -> void:
+	dir = d
+	sitting = true
+	position += Vector2(0, -3)
+	if sit_tex and (d == Dir.SE or d == Dir.SW):
+		_stand_tex = sprite.texture
+		_stand_frames = Vector2i(sprite.hframes, sprite.vframes)
+		_stand_offset = sprite.offset
+		sprite.texture = sit_tex
+		sprite.hframes = 1
+		sprite.vframes = 1
+		sprite.frame = 0
+		sprite.flip_h = d == Dir.SE
+		sprite.offset = Vector2(0, -sit_tex.get_height() / 2 + 3)
+	else:
+		_set_frame(1)
+
+
+func stand() -> void:
+	if not sitting:
+		return
+	sitting = false
+	position += Vector2(0, 3)
+	if _stand_tex:
+		sprite.texture = _stand_tex
+		sprite.hframes = _stand_frames.x
+		sprite.vframes = _stand_frames.y
+		sprite.offset = _stand_offset
+		_stand_tex = null
+	_set_frame(1)
+
+
 func face_tile(t: Vector2i) -> void:
 	var d := t - tile
 	if d.x > 0:
