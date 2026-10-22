@@ -4,6 +4,9 @@ extends Node
 signal changed
 
 const SAVE_PATH := "user://cafe_save.json"
+const TEST_SAVE_PATH := "user://cafe_save_test.json"
+## `godot -- --test-save` plays on a throwaway copy so test runs never touch the real save.
+var save_path := SAVE_PATH
 
 const FOODS := {
 	"coffee":     {"name": "Hot Coffee",       "price": 8,  "cook": 3.0, "unlock": 0},
@@ -51,7 +54,7 @@ const STAFF := {
 	"leo":       {"name": "Leo",       "title": "Rookie Waiter",       "rarity": "R",   "sheet": "leo",       "job": "Waiter",
 		"stats": {"tec": 6, "agi": 13, "end": 10, "hos": 11, "foc": 7}},
 	"mira":      {"name": "Mira",      "title": "Barista",             "rarity": "R",   "sheet": "mira",      "job": "Barista",
-		"stats": {"tec": 11, "agi": 8, "end": 8, "hos": 12, "foc": 10}},
+		"stats": {"tec": 11, "agi": 8, "end": 8, "hos": 13, "foc": 13}},
 	"kaito":     {"name": "Kaito",     "title": "Swordsman Pâtissier", "rarity": "SR",  "sheet": "kaito",     "job": "Chef",
 		"stats": {"tec": 16, "agi": 13, "end": 14, "hos": 6, "foc": 15}},
 	"seraphine": {"name": "Seraphine", "title": "Royal Mage Hostess",  "rarity": "SSR", "sheet": "seraphine", "job": "Hostess",
@@ -94,24 +97,47 @@ const ITEMS := {
 
 const DAY_LENGTH := 150.0   # seconds the café is open each day
 
+## ---- shared progression (one source of truth for café AND battle) ----
+const MAX_LEVEL := 30
+## Per-level growth of the five core stats; rarity = specialisation/potential.
+const GROWTH := {"R": 0.06, "SR": 0.065, "SSR": 0.07}
+## Materials won in battle. golden_sugar: next dish cooked gains +1 star tier.
+## training_manual: +120 XP for one character (Staff panel).
+const MATERIALS := {
+	"golden_sugar": {"name": "Golden Sugar", "desc": "Next dish cooked is one star better"},
+	"training_manual": {"name": "Training Manual", "desc": "+120 XP to one character"},
+}
+const MANUAL_XP := 120
+## Packing a battle meal costs this many times the dish price.
+const MEAL_COST_MULT := 2
+
 var coins := 50
 var gems := 300
 var rep_level := 1
 var rep_xp := 0
 var unlocked: Array = ["coffee", "croissant", "cookies"]
-var staff: Dictionary = {}           # key -> {level:int, role:String}
+var staff: Dictionary = {}           # key -> {level, xp, role, mastery:{job:xp}, bond}
 var served_total := 0
 var day := 1
 var placed: Array = []        # [{item, c, r, rot 0..3}]
 var inventory: Dictionary = {}  # item -> count owned but not placed
+var meals: Array = []           # packed battle meals [{food, tier}] (cooked by the café kitchen)
+var tickets := 0                # summon tickets (1 ticket = 1 pull)
+var materials: Dictionary = {}  # material -> count
+var cleared: Dictionary = {}    # encounter id -> victories
+var battle_hp: Dictionary = {}  # crew key -> HP ratio carried between battles (reset each new day)
 
 
 func _ready() -> void:
+	if "--test-save" in OS.get_cmdline_user_args():
+		save_path = TEST_SAVE_PATH
+		if FileAccess.file_exists(SAVE_PATH):
+			DirAccess.copy_absolute(ProjectSettings.globalize_path(SAVE_PATH), ProjectSettings.globalize_path(TEST_SAVE_PATH))
 	if not load_game():
 		new_game()
 	# starter waiter joins once his art exists (older saves included)
 	if not staff.has("leo") and sheet_exists("leo"):
-		staff["leo"] = {"level": 1, "role": "Waiter"}
+		staff["leo"] = new_member("Waiter")
 
 
 func new_game() -> void:
@@ -120,13 +146,25 @@ func new_game() -> void:
 	rep_level = 1
 	rep_xp = 0
 	unlocked = ["coffee", "croissant", "cookies"]
-	staff = {"hana": {"level": 1, "role": "Chef"}}
+	staff = {"hana": new_member("Chef")}
 	if sheet_exists("leo"):
-		staff["leo"] = {"level": 1, "role": "Waiter"}
+		staff["leo"] = new_member("Waiter")
 	served_total = 0
 	day = 1
 	placed = default_layout(2)
 	inventory = {}
+	meals = []
+	tickets = 0
+	materials = {}
+	cleared = {}
+	battle_hp = {}
+
+
+## A crew member's permanent record. mastery (job -> XP) and bond are
+## extension points: mastery grows from café work, bond is reserved for
+## interactions / combo skills.
+func new_member(role: String) -> Dictionary:
+	return {"level": 1, "xp": 0, "role": role, "mastery": {}, "bond": 0}
 
 
 func sheet_exists(key: String) -> bool:
@@ -163,20 +201,142 @@ func pull(count: int) -> Array:
 		var key: String = pool[randi() % pool.size()]
 		var is_new := not staff.has(key)
 		if is_new:
-			staff[key] = {"level": 1, "role": STAFF[key]["job"]}
-		else:
-			staff[key]["level"] = min(int(staff[key]["level"]) + 1, 10)
+			staff[key] = new_member(STAFF[key]["job"])
+		else:  # duplicate: one level up
+			staff[key]["level"] = min(int(staff[key]["level"]) + 1, MAX_LEVEL)
 		results.append({"key": key, "new": is_new, "level": staff[key]["level"]})
 	changed.emit()
 	save_game()
 	return results
 
 
-## Stat value with level growth (+6% per level).
+## Core stat with level growth (rarity sets the growth rate). Café work AND
+## combat both read this, so every level-up helps both.
 func stat(key: String, s: String) -> float:
 	var base: float = STAFF[key]["stats"][s]
 	var lv: int = staff[key]["level"]
-	return base * (1.0 + 0.06 * (lv - 1))
+	return base * (1.0 + GROWTH[STAFF[key]["rarity"]] * (lv - 1))
+
+
+func level(key: String) -> int:
+	return int(staff[key]["level"])
+
+
+func xp_needed(lv: int) -> int:
+	return 40 + lv * 30
+
+
+## Grant XP; returns how many levels were gained.
+func add_xp(key: String, amount: int) -> int:
+	var m: Dictionary = staff[key]
+	var gained := 0
+	m["xp"] = int(m.get("xp", 0)) + amount
+	while int(m["level"]) < MAX_LEVEL and int(m["xp"]) >= xp_needed(int(m["level"])):
+		m["xp"] = int(m["xp"]) - xp_needed(int(m["level"]))
+		m["level"] = int(m["level"]) + 1
+		gained += 1
+	if int(m["level"]) >= MAX_LEVEL:
+		m["xp"] = 0
+	changed.emit()
+	return gained
+
+
+## Combat stats derived from the five core stats + level.
+func combat_stats(key: String) -> Dictionary:
+	var lv := level(key)
+	return {
+		"hp": 80.0 + stat(key, "end") * 12.0 + lv * 8.0,
+		"atk": 5.0 + stat(key, "tec") * 2.0 + lv,
+		"def": 2.0 + stat(key, "end") * 0.5,
+		"spd": 10.0 + stat(key, "agi"),
+		"crit": 3.0 + stat(key, "foc") * 0.5,
+		"heal": 4.0 + stat(key, "hos") * 2.0 + lv,
+	}
+
+
+## Job mastery (extension point): café tasks completed in a job.
+func add_mastery(key: String, job: String, amount: int = 1) -> void:
+	var m: Dictionary = staff[key].get("mastery", {})
+	m[job] = int(m.get(job, 0)) + amount
+	staff[key]["mastery"] = m
+
+
+func mastery_level(key: String, job: String) -> int:
+	return int(sqrt(float(staff[key].get("mastery", {}).get(job, 0)) / 10.0))
+
+
+## The kitchen's best cook (highest TEC + FOC, preferring assigned Chefs).
+func best_cook() -> String:
+	var best := ""
+	var best_s := -1.0
+	for k in staff:
+		var sc := stat(k, "tec") + stat(k, "foc") * 0.5 + (100.0 if staff[k]["role"] == "Chef" else 0.0)
+		if sc > best_s:
+			best_s = sc
+			best = k
+	return best
+
+
+func meal_cost(food: String) -> int:
+	return int(FOODS[food]["price"]) * MEAL_COST_MULT
+
+
+## Pack a battle meal from an unlocked recipe; quality rolled by the best cook.
+func pack_meal(food: String) -> Dictionary:
+	if not food in unlocked or coins < meal_cost(food):
+		return {}
+	coins -= meal_cost(food)
+	var cook := best_cook()
+	var tier := roll_quality(cook, food, staff[cook]["role"], false)
+	var meal := {"food": food, "tier": tier}
+	meals.append(meal)
+	changed.emit()
+	save_game()
+	return meal
+
+
+## Remove one meal (exactly once) and save immediately.
+func consume_meal(index: int) -> Dictionary:
+	if index < 0 or index >= meals.size():
+		return {}
+	var meal: Dictionary = meals[index]
+	meals.remove_at(index)
+	save_game()
+	return meal
+
+
+func add_material(id: String, n: int = 1) -> void:
+	materials[id] = int(materials.get(id, 0)) + n
+	changed.emit()
+
+
+func use_material(id: String) -> bool:
+	if int(materials.get(id, 0)) <= 0:
+		return false
+	materials[id] = int(materials[id]) - 1
+	if materials[id] <= 0:
+		materials.erase(id)
+	changed.emit()
+	return true
+
+
+## HP a crew member starts a battle with. Knocked-out crew limp in at 25%.
+func battle_hp_ratio(key: String) -> float:
+	return clampf(float(battle_hp.get(key, 1.0)), 0.25, 1.0)
+
+
+## A night's rest: everyone back to full for the next day's battles.
+func rest_crew() -> void:
+	battle_hp.clear()
+
+
+## One summon using a ticket instead of gems.
+func pull_ticket() -> Array:
+	if tickets <= 0:
+		return []
+	tickets -= 1
+	gems += PULL_COST
+	return pull(1)
 
 
 ## Speed multiplier from AGI (10 AGI = 1.0x).
@@ -314,16 +474,18 @@ func save_game() -> void:
 		"unlocked": unlocked, "staff": staff,
 		"served_total": served_total, "version": 3,
 		"day": day, "placed": placed, "inventory": inventory,
+		"meals": meals, "tickets": tickets, "materials": materials, "cleared": cleared,
+		"battle_hp": battle_hp,
 	}
-	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
+	var f := FileAccess.open(save_path, FileAccess.WRITE)
 	if f:
 		f.store_string(JSON.stringify(data))
 
 
 func load_game() -> bool:
-	if not FileAccess.file_exists(SAVE_PATH):
+	if not FileAccess.file_exists(save_path):
 		return false
-	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
+	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(save_path))
 	if typeof(parsed) != TYPE_DICTIONARY:
 		return false
 	var d: Dictionary = parsed
@@ -340,6 +502,18 @@ func load_game() -> bool:
 			placed.append({"item": p["item"], "c": int(p["c"]), "r": int(p["r"]), "rot": int(p.get("rot", 0)) % 4})
 	if placed.is_empty():  # pre-layout save: rebuild with the tables bought back then
 		placed = default_layout(int(d.get("tables_owned", 2)))
+	meals = []
+	for m in d.get("meals", []):
+		if FOODS.has(m.get("food", "")) and str(m.get("tier", "")) in TIERS:
+			meals.append({"food": m["food"], "tier": m["tier"]})
+	tickets = int(d.get("tickets", 0))
+	materials = {}
+	var mats: Dictionary = d.get("materials", {})
+	for k in mats:
+		if MATERIALS.has(k):
+			materials[k] = int(mats[k])
+	cleared = d.get("cleared", {})
+	battle_hp = d.get("battle_hp", {})
 	inventory = {}
 	var inv: Dictionary = d.get("inventory", {})
 	for k in inv:
@@ -353,7 +527,12 @@ func load_game() -> bool:
 			# v1 saves parked new pulls on Rest and only knew Chef/Waiter
 			if role not in JOBS or (int(d.get("version", 1)) < 2 and role == "Rest"):
 				role = STAFF[k]["job"]
-			staff[k] = {"level": int(s[k]["level"]), "role": role}
+			var m := new_member(role)
+			m["level"] = clampi(int(s[k]["level"]), 1, MAX_LEVEL)
+			m["xp"] = int(s[k].get("xp", 0))
+			m["mastery"] = s[k].get("mastery", {})
+			m["bond"] = int(s[k].get("bond", 0))
+			staff[k] = m
 	if staff.is_empty():
-		staff = {"hana": {"level": 1, "role": "Chef"}}
+		staff = {"hana": new_member("Chef")}
 	return true

@@ -56,6 +56,8 @@ FURNITURE = [(2, "stove"), (3, "sink"), (4, "dish_rack"), (5, "dish_tub"), (6, "
 FURNITURE_BACK = [(0, "stove"), (2, "sink"), (3, "dish_rack"), (4, "dish_tub"), (5, "espresso"),
                   (6, "prep_counter"), (7, "fridge"), (8, "table_square"), (9, "table_round"), (10, "chair"),
                   (11, "bookshelf"), (12, "lamp"), (13, "fern"), (14, "chalkboard"), (15, "trash"), (16, "rug")]
+ENEMIES = [(0, "royal_sugar_golem"), (1, "animated_teapot"), (2, "cursed_kitchenware"), (3, "flour_slime"),
+           (4, "sugar_imp")]
 GACHA = [(0, "machine"), (1, "capsule_r"), (2, "capsule_sr"), (3, "capsule_ssr"), (5, "gem_big"),
          (6, "ticket"), (8, "sparkle"), (11, "coin_big"), (15, "frame_r"), (16, "frame_sr"), (17, "frame_ssr")]
 
@@ -84,6 +86,10 @@ if __name__ == "__main__":
     if os.path.exists(os.path.join(SRC, "mv_utility_back.png")):  # back views for rotation
         objects("mv_utility_back.png", 2, os.path.join(OUT, "furniture"), [(i, n + "_back") for i, n in FURNITURE_BACK])
     print("furniture")
+    if os.path.exists(os.path.join(SRC, "mv_enemies.png")):  # battle enemies, facing south-west
+        os.makedirs(os.path.join(OUT, "enemies"), exist_ok=True)
+        objects_fit("mv_enemies.png", 4.7, os.path.join(OUT, "enemies"), ENEMIES)
+        print("enemies")
     food = list(enumerate(FOOD))
     objects("mv_food_sheet.png", 1, os.path.join(OUT, "food"), food)                 # large showcase
     objects("mv_food_sheet.png", 2, os.path.join(OUT, "food", "small"), food)        # bubbles + menu

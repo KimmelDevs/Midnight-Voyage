@@ -74,6 +74,12 @@ var theme_ui: Theme
 var phase := "open"
 var day_t := 0.0
 
+# battles
+var battle: BattleScene
+var prep_enc: EncounterData
+var prep_team: Array[String] = []
+var prep_meal := -1
+
 # edit mode
 var editing := false
 var held: Dictionary = {}       # {item, rot, from: Vector2i or null}
@@ -137,6 +143,30 @@ func _ready() -> void:
 		_update_ghost()
 		await get_tree().create_timer(1.0).timeout
 		_place(Vector2i(0, 1))
+	if "--demo-battle" in args or "--demo-boss" in args:  # auto-run an encounter with the first 3 crew
+		await get_tree().create_timer(1.0).timeout
+		prep_enc = BattleDB.encounters()[3 if "--demo-boss" in args else 0]
+		prep_team.assign(GS.staff.keys().slice(0, 3))
+		prep_meal = -1
+		if "--demo-meal" in args:
+			GS.coins += 100
+			GS.pack_meal(GS.unlocked[0])
+			prep_meal = GS.meals.size() - 1
+		_start_battle()
+		battle.manager.speed_mult = 2.0
+		if "--demo-return" in args:  # press "Return to Café" once results are up
+			while not battle.result_shown:
+				await get_tree().create_timer(0.5).timeout
+			await get_tree().create_timer(2.0).timeout
+			_end_battle()
+	if "--demo-board" in args:
+		await get_tree().create_timer(1.0).timeout
+		_open_board()
+	if "--demo-prepare" in args:
+		await get_tree().create_timer(1.0).timeout
+		prep_enc = BattleDB.encounters()[0]
+		prep_team.assign(GS.staff.keys().slice(0, 3))
+		_open_prepare()
 	if "--demo-staff" in args:
 		await get_tree().create_timer(3.0).timeout
 		_open_staff()
@@ -581,7 +611,7 @@ func _staff_loop(key: String) -> void:
 			if a.tile != idle:
 				await walk(a, idle)
 				a.face(Actor.Dir.SE)
-			await get_tree().create_timer(0.4).timeout
+			await get_tree().create_timer(0.4, false).timeout
 			continue
 		working[key] = true
 		match task["type"]:
@@ -596,6 +626,8 @@ func _staff_loop(key: String) -> void:
 			"wash":
 				await _do_wash(key, a)
 		working[key] = false
+		if GS.staff.has(key):
+			GS.add_mastery(key, _role(key))
 
 
 ## Stamina drains while working (END slows it); tired staff rest until 40%.
@@ -627,6 +659,8 @@ func _work(a: Actor, dur: float, icon: Texture2D, col: Color) -> void:
 	var t := 0.0
 	while t < dur:
 		await get_tree().process_frame
+		if get_tree().paused:  # battle in progress: the café is frozen
+			continue
 		t += get_process_delta_time()
 		a.bubble.set_progress(t / dur, col)
 	a.bubble.visible = false
@@ -647,7 +681,7 @@ func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
 		kind = "counter"
 	var st := _nearest_station(kind, a.tile, true, key)
 	if st.x < 0:
-		await get_tree().create_timer(0.5).timeout  # every station busy: try again
+		await get_tree().create_timer(0.5, false).timeout  # every station busy: try again
 		return
 	o["state"] = "cooking"
 	station_busy[st] = key
@@ -661,6 +695,9 @@ func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
 		orders.erase(o)
 		return
 	o["tier"] = GS.roll_quality(key, o["food"], _role(key), is_tired(key))
+	if o["tier"] != "diamond" and o["tier"] != "black" and GS.use_material("golden_sugar"):
+		o["tier"] = GS.TIERS[GS.TIERS.find(o["tier"]) + 1]
+		_float_text(a.position + Vector2(0, -80), "Golden Sugar!", Color("ffd86b"))
 	o["maker"] = key
 	var counter := _nearest_station("counter", a.tile, false)
 	if counter.x < 0:
@@ -845,7 +882,7 @@ func _customer_flow(c: Dictionary) -> void:
 		var badge := _star(tier)
 		badge.position = Vector2(0, -16)
 		plate.add_child(badge)
-		await get_tree().create_timer(2.0 if tier == "black" else 5.0).timeout
+		await get_tree().create_timer(2.0 if tier == "black" else 5.0, false).timeout
 		badge.queue_free()
 		_pay(c, food, tier)
 	else:
@@ -945,6 +982,7 @@ func _open_cafe() -> void:
 	if editing:
 		_set_editing(false)
 	GS.day += 1
+	GS.rest_crew()
 	day_t = 0.0
 	spawn_t = 2.0
 	phase = "open"
@@ -1051,10 +1089,11 @@ func _build_ui() -> void:
 
 	# side buttons
 	var side := VBoxContainer.new()
-	side.position = Vector2(6, 236)
+	side.position = Vector2(6, 210)
 	side.add_theme_constant_override("separation", 4)
 	root.add_child(side)
-	for pair in [["Menu", _open_menu], ["Staff", _open_staff], ["Summon", _open_summon], ["Shop", _open_shop]]:
+	for pair in [["Menu", _open_menu], ["Staff", _open_staff], ["Summon", _open_summon], ["Shop", _open_shop],
+			["Battles", _open_board]]:
 		var b := Button.new()
 		b.text = pair[0]
 		b.custom_minimum_size = Vector2(70, 24)
@@ -1069,7 +1108,7 @@ func _build_ui() -> void:
 
 	# night controls
 	night_bar = VBoxContainer.new()
-	night_bar.position = Vector2(6, 172)
+	night_bar.position = Vector2(6, 148)
 	night_bar.add_theme_constant_override("separation", 8)
 	night_bar.visible = false
 	root.add_child(night_bar)
@@ -1306,6 +1345,22 @@ func _open_staff() -> void:
 		if is_tired(key):
 			st.add_child(_small_label(" tired - resting", 9))
 		info.add_child(st)
+		var m: Dictionary = GS.staff[key]
+		var cs := GS.combat_stats(key)
+		info.add_child(_small_label("XP %d/%d   Battle: HP %d ATK %d DEF %d SPD %d CRIT %d%%   %s mastery Lv %d" % [
+			int(m.get("xp", 0)), GS.xp_needed(GS.level(key)), cs["hp"], cs["atk"], cs["def"], cs["spd"], cs["crit"],
+			m["role"], GS.mastery_level(key, m["role"])], 8))
+		if int(GS.materials.get("training_manual", 0)) > 0 and GS.level(key) < GS.MAX_LEVEL:
+			var mb := Button.new()
+			mb.text = "Read Training Manual (+%d XP)" % GS.MANUAL_XP
+			mb.add_theme_font_size_override("font_size", 8)
+			mb.pressed.connect(func():
+				if GS.use_material("training_manual"):
+					var up := GS.add_xp(key, GS.MANUAL_XP)
+					GS.save_game()
+					_toast("%s studied hard%s" % [GS.STAFF[key]["name"], (" - level up!" if up > 0 else ".")])
+				_open_staff())
+			info.add_child(mb)
 		hb.add_child(info)
 		var ob := OptionButton.new()
 		for r in GS.JOBS:
@@ -1356,7 +1411,12 @@ func _open_summon() -> void:
 		if GS.STAFF[k]["rarity"] == "SSR" and GS.sheet_exists(k):
 			featured.add_child(_portrait(k, true))
 	info.add_child(featured)
-	info.add_child(_small_label("You have %d gems" % GS.gems, 11))
+	info.add_child(_small_label("You have %d gems, %d tickets" % [GS.gems, GS.tickets], 11))
+	if GS.tickets > 0:
+		var bt := Button.new()
+		bt.text = "Summon x1  (1 ticket)"
+		bt.pressed.connect(func(): _do_pull(1, machine, true))
+		info.add_child(bt)
 	var b1 := Button.new()
 	b1.text = "Summon x1  (%d gems)" % GS.PULL_COST
 	b1.disabled = GS.gems < GS.PULL_COST
@@ -1369,8 +1429,8 @@ func _open_summon() -> void:
 	info.add_child(b10)
 
 
-func _do_pull(n: int, machine: Control) -> void:
-	var results := GS.pull(n)
+func _do_pull(n: int, machine: Control, ticket: bool = false) -> void:
+	var results := GS.pull_ticket() if ticket else GS.pull(n)
 	if results.is_empty():
 		_toast("Not enough gems!")
 		return
@@ -1468,6 +1528,228 @@ func _show_results(results: Array) -> void:
 	again.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	again.pressed.connect(_open_summon)
 	v.add_child(again)
+
+
+# ---- battles: Magical Encounter Board
+func _open_board() -> void:
+	var v := _open_panel("Magical Encounter Board", Vector2(470, 306))
+	var info := "Meals packed: %d    Tickets: %d    Crew HP is restored each new day." % [GS.meals.size(), GS.tickets]
+	v.add_child(_small_label(info, 9))
+	var list := _scroll(v)
+	for enc in BattleDB.encounters():
+		var row := PanelContainer.new()
+		row.add_theme_stylebox_override("panel", _sb(Color("fff6ea"), Color("f2c14e") if enc.boss else C_EDGE, 2, 4))
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", 6)
+		row.add_child(hb)
+		var faces := HBoxContainer.new()
+		faces.add_theme_constant_override("separation", 0)
+		for spec in enc.enemies:
+			var data := BattleDB.enemy(spec["id"])
+			var tr := TextureRect.new()
+			tr.texture = tex(data.sprite)
+			tr.custom_minimum_size = Vector2(34, 40)
+			tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+			faces.add_child(tr)
+		hb.add_child(faces)
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 0)
+		col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var names: Array[String] = []
+		for spec in enc.enemies:
+			names.append("%s Lv%d" % [BattleDB.enemy(spec["id"]).display_name, spec["level"]])
+		col.add_child(_small_label(("BOSS  " if enc.boss else "") + enc.display_name + "   (rec. Lv %d)" % enc.recommended_level, 11))
+		col.add_child(_small_label(enc.description, 8))
+		col.add_child(_small_label(", ".join(names), 8))
+		col.add_child(_small_label(_reward_text(enc), 8))
+		hb.add_child(col)
+		var b := Button.new()
+		b.text = "Prepare"
+		b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		b.pressed.connect(func():
+			prep_enc = enc
+			prep_team.clear()
+			prep_meal = -1
+			_open_prepare())
+		hb.add_child(b)
+		list.add_child(row)
+
+
+func _reward_text(enc: EncounterData) -> String:
+	var parts: Array[String] = ["Coins", "XP"]
+	for d in enc.drops:
+		match d["kind"]:
+			"material": parts.append(GS.MATERIALS[d["id"]]["name"])
+			"tickets": parts.append("Ticket")
+			"gems": parts.append("Gems")
+	var first := ""
+	if int(GS.cleared.get(str(enc.id), 0)) == 0:
+		var fc: Array[String] = []
+		for d in enc.first_clear:
+			fc.append({"material": GS.MATERIALS.get(d.get("id", ""), {}).get("name", ""), "tickets": "%d Ticket" % d["n"],
+				"gems": "%d Gems" % d["n"]}[d["kind"]])
+		if enc.unlock_recipe:
+			fc.append("a new recipe")
+		first = "   First clear: " + ", ".join(fc)
+	else:
+		first = "   Cleared x%d" % int(GS.cleared[str(enc.id)])
+	return "Rewards: " + ", ".join(parts) + first
+
+
+func _open_prepare() -> void:
+	var enc := prep_enc
+	var v := _open_panel("Prepare: " + enc.display_name, Vector2(470, 306))
+	var cols := HBoxContainer.new()
+	cols.add_theme_constant_override("separation", 8)
+	cols.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	v.add_child(cols)
+
+	# crew picker
+	var left := VBoxContainer.new()
+	left.custom_minimum_size = Vector2(170, 0)
+	left.add_child(_small_label("Crew (click to add / remove)", 9))
+	var sc := ScrollContainer.new()
+	sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	left.add_child(sc)
+	var grid := GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 2)
+	grid.add_theme_constant_override("v_separation", 2)
+	sc.add_child(grid)
+	for key in GS.staff:
+		var b := Button.new()
+		b.custom_minimum_size = Vector2(54, 84)
+		var cap := _small_label("%s\nLv%d %d%%" % [GS.STAFF[key]["name"], GS.level(key), int(GS.battle_hp_ratio(key) * 100)], 8)
+		cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		cap.custom_minimum_size = Vector2(54, 24)
+		cap.size = Vector2(54, 24)
+		cap.position = Vector2(0, 56)
+		cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		b.add_child(cap)
+		var face := _portrait(key, true)   # combat outfit, cropped to head + body
+		var ft: AtlasTexture = face.texture
+		ft.region.size.y = minf(ft.region.size.y, 52.0)
+		face.custom_minimum_size = ft.region.size
+		face.size = ft.region.size
+		face.position = Vector2((54 - ft.region.size.x) / 2.0, 3)
+		face.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		b.add_child(face)
+		if key in prep_team:
+			b.add_theme_stylebox_override("normal", _sb(Color("f2c14e"), C_EDGE, 2, 2))
+			b.add_theme_stylebox_override("hover", _sb(Color("f6d27a"), C_EDGE, 2, 2))
+		b.pressed.connect(func():
+			if key in prep_team:
+				prep_team.erase(key)
+			elif prep_team.size() < 3:
+				prep_team.append(key)
+			_open_prepare())
+		grid.add_child(b)
+	cols.add_child(left)
+
+	# formation + meal
+	var right := VBoxContainer.new()
+	right.custom_minimum_size = Vector2(270, 0)
+	right.add_theme_constant_override("separation", 3)
+	cols.add_child(right)
+	right.add_child(_small_label("Formation (front draws the most attacks)", 9))
+	var slots := ["Front", "Middle", "Back"]
+	for i in 3:
+		var line := "%s: -" % slots[i]
+		if i < prep_team.size():
+			var k: String = prep_team[i]
+			var cs := GS.combat_stats(k)
+			line = "%s: %s  HP %d ATK %d DEF %d SPD %d CRIT %d%%" % [slots[i], GS.STAFF[k]["name"],
+				cs["hp"] * GS.battle_hp_ratio(k), cs["atk"], cs["def"], cs["spd"], cs["crit"]]
+			var sk: AbilityData = BattleDB.kit(k)["skill"]
+			if sk:
+				line += "\n   %s: %s" % [sk.display_name, sk.description]
+		var fl := _small_label(line, 8)
+		fl.autowrap_mode = TextServer.AUTOWRAP_WORD
+		fl.custom_minimum_size = Vector2(270, 0)
+		right.add_child(fl)
+
+	right.add_child(_small_label("Meal for this battle (eaten when it starts)", 9))
+	var mo := OptionButton.new()
+	mo.add_item("No meal")
+	for i in GS.meals.size():
+		var m: Dictionary = GS.meals[i]
+		mo.add_item("%s [%s] %s" % [GS.FOODS[m["food"]]["name"], GS.TIER_NAME[m["tier"]], BattleDB.meal_text(m)])
+	mo.selected = prep_meal + 1 if prep_meal < GS.meals.size() else 0
+	mo.add_theme_font_size_override("font_size", 9)
+	mo.custom_minimum_size = Vector2(270, 0)
+	mo.clip_text = true
+	mo.item_selected.connect(func(i: int): prep_meal = i - 1)
+	right.add_child(mo)
+
+	right.add_child(_small_label("Pack a meal (best cook rolls the star tier)", 9))
+	var pack := HBoxContainer.new()
+	var ro := OptionButton.new()
+	ro.add_theme_font_size_override("font_size", 9)
+	ro.custom_minimum_size = Vector2(170, 0)
+	ro.clip_text = true
+	for f in GS.unlocked:
+		ro.add_item("%s - %s" % [GS.FOODS[f]["name"], BattleDB.meal_text({"food": f, "tier": "silver"})])
+	pack.add_child(ro)
+	var pb := Button.new()
+	pb.add_theme_font_size_override("font_size", 9)
+	var pick := func() -> String: return GS.unlocked[maxi(ro.selected, 0)]
+	pb.text = "Pack (%d coins)" % GS.meal_cost(pick.call())
+	ro.item_selected.connect(func(_i): pb.text = "Pack (%d coins)" % GS.meal_cost(pick.call()))
+	pb.pressed.connect(func():
+		var meal := GS.pack_meal(pick.call())
+		if meal.is_empty():
+			_toast("Not enough coins.")
+		else:
+			_toast("Packed %s - %s quality!" % [GS.FOODS[meal["food"]]["name"], GS.TIER_NAME[meal["tier"]]])
+			prep_meal = GS.meals.size() - 1
+		_open_prepare())
+	pack.add_child(pb)
+	right.add_child(pack)
+
+	var btns := HBoxContainer.new()
+	btns.add_theme_constant_override("separation", 8)
+	var back := Button.new()
+	back.text = "Back"
+	back.pressed.connect(_open_board)
+	btns.add_child(back)
+	var go := Button.new()
+	go.text = "Start Battle"
+	go.disabled = prep_team.is_empty()
+	go.pressed.connect(_start_battle)
+	btns.add_child(go)
+	right.add_child(btns)
+
+
+## Leave the café paused and fight. The meal is eaten (and saved) right here,
+## exactly once.
+func _start_battle() -> void:
+	if prep_team.is_empty() or battle != null:
+		return
+	var meal := {}
+	if prep_meal >= 0 and prep_meal < GS.meals.size():
+		meal = GS.consume_meal(prep_meal)
+	prep_meal = -1
+	_close_panel()
+	if editing:
+		_set_editing(false)
+	var team: Array[String] = []
+	team.assign(prep_team)
+	battle = BattleScene.new(prep_enc, team, meal, theme_ui)
+	battle.closed.connect(_end_battle)
+	add_child(battle)
+	ui.visible = false
+	get_tree().paused = true
+
+
+func _end_battle() -> void:
+	battle.queue_free()
+	battle = null
+	get_tree().paused = false
+	ui.visible = true
+	_refresh_hud()
+	_toast("Back at the café.")
 
 
 # ---- shop
