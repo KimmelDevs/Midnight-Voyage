@@ -12,10 +12,10 @@ const ORIGIN := Vector2(240, 70)   # top vertex of deck tile (0,0)
 const WALL_H := 74
 const HULL_DEPTH := 78.0           # hull height under the middle of the ship
 
-const REST_SPOT := Vector2i(1, 5)
+const REST_SPOT := Vector2i(6, 1)
 const IDLE_SPOTS := {
-	"Chef": Vector2i(1, 1), "Barista": Vector2i(1, 2), "Waiter": Vector2i(4, 4),
-	"Hostess": Vector2i(6, 4), "Cleaner": Vector2i(2, 4), "Rest": REST_SPOT,
+	"Chef": Vector2i(1, 1), "Barista": Vector2i(2, 1), "Waiter": Vector2i(6, 3),
+	"Hostess": Vector2i(5, 4), "Cleaner": Vector2i(4, 1), "Rest": REST_SPOT,
 }
 ## rot 0..3: facing SE, SW, NW, NE (+c, +r, -c, -r). 0/1 use the front art
 ## (1 mirrored); 2/3 use the <item>_back art when it exists.
@@ -37,7 +37,9 @@ var DOOR := Vector2i.ZERO          # gangway tile
 var deck := {}                     # Vector2i -> true
 var cabin := Rect2i()
 
-var astar := AStarGrid2D.new()
+var astar := WalledGrid.new()
+var front_walls: Array = []     # cabin front wall pieces (they fade)
+var walls_see_through := false  # H toggles
 var ship_root: Node2D
 var camera: Camera2D
 var world: Node2D
@@ -131,6 +133,7 @@ func _ready() -> void:
 	world.y_sort_enabled = true
 	ship_root.add_child(world)
 	_build_front_rails()
+	_build_front_walls()
 	fx = Node2D.new()
 	fx.z_index = 50
 	ship_root.add_child(fx)
@@ -144,9 +147,7 @@ func _ready() -> void:
 	ghost.z_index = 60
 	ghost.visible = false
 	ship_root.add_child(ghost)
-	astar.region = Rect2i(0, 0, COLS, ROWS)
-	astar.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
-	astar.update()
+	astar.setup(COLS, ROWS)
 	_apply_layout()
 	_load_customer_sheets()
 	_build_ui()
@@ -368,13 +369,64 @@ func _build_front_rails() -> void:
 	_kit_at("gangway", gate + Vector2(-22, 22), 0, Vector2(0.5, 0.5), true, true)
 
 
+## Cabin front edges as [inside tile, outside tile]. doors = only the open ones,
+## otherwise only the walled ones.
+func _cabin_front_edges(doors: bool) -> Array:
+	var out: Array = []
+	var open := {}
+	for d in GS.ship.get("doors", []):
+		open[Vector2i(int(d[0]), int(d[1]))] = true
+	var r := cabin.end.y - 1
+	for c in range(cabin.position.x, cabin.end.x):
+		var t := Vector2i(c, r)
+		if deck.has(t + Vector2i(0, 1)) and open.has(t) == doors:
+			out.append([t, t + Vector2i(0, 1)])
+	var c2 := cabin.end.x - 1
+	for rr in range(cabin.position.y, cabin.end.y):
+		var t := Vector2i(c2, rr)
+		if deck.has(t + Vector2i(1, 0)) and not doors:
+			out.append([t, t + Vector2i(1, 0)])
+	return out
+
+
+## Full-height front walls of the café room (window wall pieces from the kit),
+## y-sorted with the furniture. Door gaps follow GS.ship["doors"].
+func _build_front_walls() -> void:
+	front_walls.clear()
+	var open := {}
+	for d in GS.ship.get("doors", []):
+		open[Vector2i(int(d[0]), int(d[1]))] = true
+	var r := cabin.end.y - 1
+	for c in range(cabin.position.x, cabin.end.x - 1, 2):
+		if open.has(Vector2i(c, r)) or open.has(Vector2i(c + 1, r)):
+			continue
+		var a := tile_pos(Vector2i(c, r)) + Vector2(-HW, 0)
+		var b := tile_pos(Vector2i(c + 1, r)) + Vector2(0, HH)
+		front_walls.append(_kit_edge("wall_window_a", "bottom", a, b, 0, true))
+	var c2 := cabin.end.x - 1
+	for rr in range(cabin.position.y, cabin.end.y - 1, 2):
+		var a := tile_pos(Vector2i(c2, rr)) + Vector2(HW, 0)
+		var b := tile_pos(Vector2i(c2, rr + 1)) + Vector2(0, HH)
+		front_walls.append(_kit_edge("wall_window_a", "bottom", a, b, 0, true))
+
+
+## Front walls are solid from outside but fade while you edit, point the
+## mouse into the café room, or press H.
+func _fade_walls(delta: float) -> void:
+	var see := walls_see_through or editing or (in_cabin(mouse_tile()) and not overlay.visible)
+	var target := 0.22 if see else 1.0
+	for w in front_walls:
+		if is_instance_valid(w):
+			w.modulate.a = move_toward(w.modulate.a, target, delta * 4.0)
+
+
 ## Lay a kit piece along a tile edge: its anchor line (top or bottom edge of
 ## the art, from kit.json) is stretched/sheared onto a -> b. When a is the
 ## right-hand end the piece comes out mirrored (other side of the ship).
-func _kit_edge(piece: String, edge: String, a: Vector2, b: Vector2, z: int, sorted := false) -> void:
+func _kit_edge(piece: String, edge: String, a: Vector2, b: Vector2, z: int, sorted := false) -> Node2D:
 	var t := tex("res://assets/ship/%s.png" % piece)
 	if t == null or not kit.has(piece):
-		return
+		return null
 	var m: Array = kit[piece][edge]
 	var s := Vector2(m[0][0], m[0][1])
 	var e := Vector2(m[1][0], m[1][1])
@@ -390,10 +442,11 @@ func _kit_edge(piece: String, edge: String, a: Vector2, b: Vector2, z: int, sort
 		spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), origin - holder.position)
 		holder.add_child(spr)
 		world.add_child(holder)
-	else:
-		spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), origin)
-		spr.z_index = z
-		ship_root.add_child(spr)
+		return holder
+	spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), origin)
+	spr.z_index = z
+	ship_root.add_child(spr)
+	return spr
 
 
 ## Place a kit piece with its pivot (fractions of its size) at a point.
@@ -443,12 +496,15 @@ func _kind(item: String) -> String:
 
 ## Texture + mirror flag for an item at a rotation.
 func _item_look(item: String, rot: int) -> Array:
+	var native := int(GS.ITEMS[item].get("faces", 1))   # 0 = SE, 1 = SW
 	if rot >= 2:
 		var back := tex(GS.item_tex_path(item).replace(".png", "_back.png"))
 		if back:
-			# back art faces NW; "back_flip" items were drawn facing NE instead
-			return [back, (rot == 3) != bool(GS.ITEMS[item].get("back_flip", false))]
-	return [tex(GS.item_tex_path(item)), rot % 2 == 1]
+			# back art is the front turned around (SW -> NE, SE -> NW); "back_flip" fixes odd ones
+			var native_back := native + 2
+			return [back, (rot != native_back) != bool(GS.ITEMS[item].get("back_flip", false))]
+		rot -= 2  # no back art: use the front, mirrored to the nearest facing
+	return [tex(GS.item_tex_path(item)), rot != native]
 
 
 func _rotations(item: String) -> int:
@@ -479,6 +535,9 @@ func _apply_layout() -> void:
 	rug_at.clear()
 	stations.clear()
 	astar.fill_solid_region(astar.region, false)
+	astar.clear_walls()
+	for w in _cabin_front_edges(false):  # cabin walls block movement except at doors
+		astar.set_wall(w[0], w[1])
 	for c in COLS:
 		for r in ROWS:
 			if not deck.has(Vector2i(c, r)):
@@ -531,13 +590,16 @@ func _station_list(kind: String) -> Array:
 ## Where to stand to use a station: its front tile if free, else any free side.
 func work_tile(st: Vector2i) -> Vector2i:
 	var p: Dictionary = GS.placed[occupied[st]]
-	var order: Array[Vector2i] = [ROT_DIRS[p["rot"]]]
+	var front: Vector2i = ROT_DIRS[p["rot"]]
+	if _kind(p["item"]) == "counter":
+		front = -front  # staff stand behind the counter
+	var order: Array[Vector2i] = [front]
 	for d in ROT_DIRS:
 		if d != order[0]:
 			order.append(d)
 	for d in order:
 		var n: Vector2i = st + d
-		if in_room(n) and not astar.is_point_solid(n):
+		if in_room(n) and not astar.is_point_solid(n) and astar.edge_open(st, n):
 			return n
 	return st
 
@@ -587,7 +649,7 @@ func layout_ok(extra_solid: Vector2i = Vector2i(-1, -1)) -> bool:
 		var t: Vector2i = queue.pop_front()
 		for d in ROT_DIRS:
 			var n: Vector2i = t + d
-			if in_room(n) and not seen.has(n) and kind_at.call(n) == "":
+			if in_room(n) and not seen.has(n) and kind_at.call(n) == "" and astar.edge_open(t, n):
 				seen[n] = true
 				queue.append(n)
 	var tiles: Array = occupied.keys()
@@ -603,7 +665,7 @@ func layout_ok(extra_solid: Vector2i = Vector2i(-1, -1)) -> bool:
 			continue
 		var ok := false
 		for d in ROT_DIRS:
-			if seen.has(t + d):
+			if seen.has(t + d) and astar.edge_open(t, t + d):
 				ok = true
 				break
 		if not ok:
@@ -624,7 +686,7 @@ func free_neighbor(t: Vector2i, toward: Vector2i) -> Vector2i:
 	var best_d := 1 << 30
 	for d in [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
 		var n: Vector2i = t + d
-		if not astar.is_in_boundsv(n) or astar.is_point_solid(n):
+		if not astar.is_in_boundsv(n) or astar.is_point_solid(n) or not astar.edge_open(t, n):
 			continue
 		var dist: int = absi(n.x - toward.x) + absi(n.y - toward.y)
 		if dist < best_d:
@@ -1118,6 +1180,7 @@ func _process(delta: float) -> void:
 		float(Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN)) - float(Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP)))
 	if pan != Vector2.ZERO and not overlay.visible:
 		_move_camera(pan * 220.0 * delta)
+	_fade_walls(delta)
 	match phase:
 		"open":
 			day_t += delta
@@ -1359,7 +1422,7 @@ func _build_ui() -> void:
 	edit_hint.add_theme_color_override("font_color", Color("fff6ea"))
 	edit_hint.add_theme_color_override("font_outline_color", Color("2a1a22"))
 	edit_hint.add_theme_constant_override("outline_size", 4)
-	edit_hint.text = "Click: pick up / place    Right-click or R: rotate    Del: put away    Esc: cancel"
+	edit_hint.text = "Click: pick up / place    Right-click or R: rotate    Del: put away    Esc: cancel    H: walls"
 	edit_hint.visible = false
 	root.add_child(edit_hint)
 
@@ -2485,6 +2548,9 @@ func _move_camera(d: Vector2) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and event.keycode == KEY_H:
+		walls_see_through = not walls_see_through
+		_toast("Walls: " + ("see-through" if walls_see_through else "solid (fade when you point inside)"))
 	if event is InputEventMouseMotion and not overlay.visible:
 		var m: int = event.button_mask
 		if m & MOUSE_BUTTON_MASK_MIDDLE or (not editing and m & (MOUSE_BUTTON_MASK_LEFT | MOUSE_BUTTON_MASK_RIGHT)):
@@ -2589,3 +2655,86 @@ class CloudNode extends Node2D:
 				var o := Vector2(j * s * 0.8 - s * 1.2, sin(j * 2.1) * s * 0.25)
 				draw_circle(p + o, s * (0.7 + 0.2 * (j % 2)), col)
 				draw_circle(p + o + Vector2(0, -3), s * (0.6 + 0.2 * (j % 2)), top)
+
+
+## Grid pathfinding with walls on tile EDGES (AStarGrid2D can only block
+## whole tiles). Same API the café code already uses.
+class WalledGrid extends RefCounted:
+	var cols := 0
+	var rows := 0
+	var region := Rect2i()
+	var solid := {}
+	var walls := {}
+	var a2 := AStar2D.new()
+	var dirty := true
+
+	func setup(c: int, r: int) -> void:
+		cols = c
+		rows = r
+		region = Rect2i(0, 0, c, r)
+		dirty = true
+
+	func _id(t: Vector2i) -> int:
+		return t.y * cols + t.x
+
+	func _key(a: Vector2i, b: Vector2i) -> int:
+		var ia := _id(a)
+		var ib := _id(b)
+		return mini(ia, ib) * 100000 + maxi(ia, ib)
+
+	func is_in_boundsv(t: Vector2i) -> bool:
+		return region.has_point(t)
+
+	func set_point_solid(t: Vector2i, v: bool = true) -> void:
+		if v:
+			solid[t] = true
+		else:
+			solid.erase(t)
+		dirty = true
+
+	func is_point_solid(t: Vector2i) -> bool:
+		return solid.has(t) or not region.has_point(t)
+
+	func fill_solid_region(_r: Rect2i, v: bool) -> void:
+		if not v:
+			solid.clear()
+		dirty = true
+
+	func clear_walls() -> void:
+		walls.clear()
+		dirty = true
+
+	func set_wall(a: Vector2i, b: Vector2i) -> void:
+		walls[_key(a, b)] = true
+		dirty = true
+
+	func edge_open(a: Vector2i, b: Vector2i) -> bool:
+		return not walls.has(_key(a, b))
+
+	func _rebuild() -> void:
+		a2.clear()
+		for r in rows:
+			for c in cols:
+				var t := Vector2i(c, r)
+				a2.add_point(_id(t), Vector2(c, r))
+		for r in rows:
+			for c in cols:
+				var t := Vector2i(c, r)
+				for d in [Vector2i(1, 0), Vector2i(0, 1)]:
+					var n: Vector2i = t + d
+					if region.has_point(n) and edge_open(t, n):
+						a2.connect_points(_id(t), _id(n))
+		for t in solid:
+			if region.has_point(t):
+				a2.set_point_disabled(_id(t), true)
+		dirty = false
+
+	func get_id_path(from: Vector2i, to: Vector2i) -> Array[Vector2i]:
+		if dirty:
+			_rebuild()
+		var out: Array[Vector2i] = []
+		if not region.has_point(from) or not region.has_point(to):
+			return out
+		for i in a2.get_id_path(_id(from), _id(to)):
+			out.append(Vector2i(i % cols, i / cols))
+		return out

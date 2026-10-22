@@ -73,6 +73,8 @@ const GEM_TRADE := {"coins": 300, "gems": 50}
 ## rack (faster washing), fridge (faster cooking), table/chair (seating),
 ## rug (walkable floor decor), deco (ambience: patience + tips).
 ## Art lives in assets/furniture/<key>.png unless "tex" says otherwise.
+## "faces": which way the unmirrored art points (0 = SE, 1 = SW; default 1 -
+## the ChatGPT furniture faces lower-left, chairs face lower-right).
 const ITEMS := {
 	"stove":           {"name": "Stove",           "kind": "stove",    "cost": 160},
 	"espresso":        {"name": "Espresso Machine", "kind": "espresso", "cost": 180},
@@ -84,7 +86,7 @@ const ITEMS := {
 	"fridge":          {"name": "Fridge",          "kind": "fridge",   "cost": 200},
 	"table_round":     {"name": "Round Table",     "kind": "table",    "cost": 90},
 	"table_square":    {"name": "Square Table",    "kind": "table",    "cost": 80},
-	"chair":           {"name": "Chair",           "kind": "chair",    "cost": 40, "back_flip": true},
+	"chair":           {"name": "Chair",           "kind": "chair",    "cost": 40, "faces": 0, "back_flip": true},
 	"bookshelf":       {"name": "Bookshelf",       "kind": "deco",     "cost": 110, "ambience": 3},
 	"lamp":            {"name": "Standing Lamp",   "kind": "deco",     "cost": 70, "ambience": 2},
 	"fern":            {"name": "Potted Fern",     "kind": "deco",     "cost": 45, "ambience": 2},
@@ -109,7 +111,9 @@ const SHIP_TEMPLATE := [
 	"XXXXXXXXXXXX",
 	"XXXXXXXXXXXX",
 ]
-const SHIP_CABIN := [0, 0, 6, 4]     ## [c, r, width, height] indoor café cabin at the stern
+const SHIP_CABIN := [0, 0, 8, 4]     ## [c, r, width, height] indoor café room at the stern
+## Cabin front-row tiles whose outer (lower-left) wall is an open doorway.
+const SHIP_CABIN_DOORS := [[4, 3], [5, 3]]
 const SHIP_GANGWAY := [6, 5]         ## deck tile where customers come aboard
 
 ## ---- shared progression (one source of truth for café AND battle) ----
@@ -790,23 +794,58 @@ func unlock_food(key: String) -> bool:
 
 ## Starting café. `tables` (2-4) keeps tables bought in pre-layout saves.
 func default_ship() -> Dictionary:
-	return {"deck": SHIP_TEMPLATE.duplicate(), "cabin": SHIP_CABIN.duplicate(), "gangway": SHIP_GANGWAY.duplicate()}
+	return {"deck": SHIP_TEMPLATE.duplicate(), "cabin": SHIP_CABIN.duplicate(), "gangway": SHIP_GANGWAY.duplicate(),
+		"doors": SHIP_CABIN_DOORS.duplicate(true)}
 
 
 ## Starting café on the ship. Kitchen + one table in the cabin, `tables`
 ## (2-4) more tables out on the open deck.
-func default_layout(tables: int) -> Array:
+## Starting café on the ship, laid out like a real café:
+##  - café room (cabin) with the kitchen line on its back wall, a work aisle,
+##    a counter with the pastry case facing the guests, and a table by the door,
+##  - outdoor seating on the deck: a bar along the back railing and round tables,
+##  - plants, lamps and a menu board for atmosphere.
+## rot = the way an item faces: 0 = SE (+c), 1 = SW (+r), 2 = NW, 3 = NE.
+func default_layout(_tables: int = 0) -> Array:
 	var out: Array = []
-	for e in [["stove", 0, 1], ["espresso", 0, 2], ["service_counter", 0, 3], ["fridge", 1, 0],
-			["sink", 2, 0], ["dish_rack", 3, 0], ["display", 5, 0], ["lamp", 6, 0],
-			["fern", 11, 0], ["chalkboard", 5, 5], ["plant", 11, 5]]:
-		out.append({"item": e[0], "c": e[1], "r": e[2], "rot": 0})
-	var spots := [Vector2i(3, 2), Vector2i(8, 2), Vector2i(10, 4), Vector2i(8, 4), Vector2i(10, 2)]
-	for i in clampi(tables + 1, 3, 5):
-		var t: Vector2i = spots[i]
-		out.append({"item": "table_round", "c": t.x, "r": t.y, "rot": 0})
-		out.append({"item": "chair", "c": t.x - 1, "r": t.y, "rot": 0})   # faces SE
-		out.append({"item": "chair", "c": t.x, "r": t.y - 1, "rot": 1})   # faces SW
+	var add := func(item: String, c: int, r: int, rot: int) -> void:
+		out.append({"item": item, "c": c, "r": r, "rot": rot})
+	# kitchen line against the back wall, facing into the room
+	add.call("fridge", 0, 0, 1)
+	add.call("stove", 1, 0, 1)
+	add.call("espresso", 2, 0, 1)
+	add.call("sink", 3, 0, 1)
+	add.call("dish_rack", 4, 0, 1)
+	add.call("dish_tub", 5, 0, 1)
+	add.call("bookshelf", 6, 0, 1)
+	add.call("plant", 7, 0, 1)
+	add.call("chalkboard", 0, 1, 0)
+	add.call("plant", 0, 2, 0)
+	add.call("fern", 0, 3, 0)
+	# counter row facing the guests; staff work behind it (aisle r = 1), gap at c = 5
+	add.call("service_counter", 1, 2, 1)
+	add.call("prep_counter", 2, 2, 1)
+	add.call("display", 3, 2, 1)
+	add.call("prep_counter", 4, 2, 1)
+	# a table inside the café room
+	add.call("table_round", 7, 2, 0)
+	add.call("chair", 6, 2, 0)
+	add.call("chair", 7, 1, 1)
+	# bar along the deck's back railing (guests look out at the sky); aisle at r = 2-3
+	for c in [8, 9, 10, 11]:
+		add.call("table_square", c, 0, 0)
+		add.call("chair", c, 1, 3)
+	# round tables on the open deck, leaving walkways from the gangway
+	add.call("table_round", 10, 4, 0)
+	add.call("chair", 9, 4, 0)
+	add.call("chair", 10, 5, 3)
+	add.call("table_round", 1, 4, 0)
+	add.call("chair", 2, 4, 2)
+	add.call("chair", 1, 5, 3)
+	add.call("lamp", 11, 3, 0)
+	add.call("plant", 11, 5, 0)
+	add.call("fern", 0, 5, 0)
+	add.call("chalkboard", 5, 5, 1)
 	return out
 
 
@@ -876,7 +915,7 @@ func save_game() -> void:
 	var data := {
 		"coins": coins, "gems": gems, "rep_level": rep_level, "rep_xp": rep_xp,
 		"unlocked": unlocked, "staff": staff,
-		"served_total": served_total, "version": 5, "ship": ship,
+		"served_total": served_total, "version": 7, "ship": ship,
 		"day": day, "placed": placed, "inventory": inventory,
 		"meals": meals, "tickets": tickets, "materials": materials, "cleared": cleared,
 		"battle_hp": battle_hp, "town": town, "airship": airship, "battle_party": battle_party,
@@ -907,7 +946,7 @@ func load_game() -> bool:
 	if placed.is_empty():  # pre-layout save: rebuild with the tables bought back then
 		placed = default_layout(int(d.get("tables_owned", 2)))
 	ship = d.get("ship", {})
-	if ship.is_empty() or int(d.get("version", 1)) < 5:  # v4 test ship had a different outline
+	if ship.is_empty() or int(d.get("version", 1)) < 7:  # cabin became the café room
 		ship = default_ship()
 	meals = []
 	for m in d.get("meals", []):
@@ -966,7 +1005,7 @@ func load_game() -> bool:
 			staff[k] = m
 	if staff.is_empty():
 		staff = {"hana": new_member("Chef")}
-	if int(d.get("version", 1)) < 4:  # one-room café -> the airship deck
+	if int(d.get("version", 1)) < 7:  # re-arrange into the café layout (extras go to storage)
 		migrate_to_ship(placed)
 	_store_off_deck()
 	return true
