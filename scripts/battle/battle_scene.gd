@@ -25,6 +25,7 @@ var timer_label: Label
 var speed_btn: Button
 var theme_ui: Theme
 var result_shown := false
+var victory := false
 
 
 func _init(p_encounter: EncounterData, p_team: Array[String], p_meal: Dictionary, p_theme: Theme) -> void:
@@ -89,6 +90,7 @@ func _make_allies() -> Array[BattleUnit]:
 			u.base[buff["stat"]] = float(u.base[buff["stat"]]) * (1.0 + float(buff["amount"]))
 		u.max_hp = u.base["hp"]
 		u.hp = clampf(round(u.max_hp * GS.battle_hp_ratio(key)), 1.0, u.max_hp)
+		u.shield = maxf(0.0, ShipStats.battle_shield())   # Stabilizer Runes
 		var k := BattleDB.kit(key)
 		u.basic = k["basic"]
 		u.skill = k["skill"]
@@ -316,6 +318,7 @@ func _on_ended(victory: bool) -> void:
 	if result_shown:
 		return
 	result_shown = true
+	self.victory = victory
 	await get_tree().create_timer(0.8).timeout
 	var report := BattleRewards.apply(encounter, manager.allies, victory, meal)
 	_show_results(victory, report)
@@ -336,6 +339,8 @@ func _show_results(victory: bool, report: Dictionary) -> void:
 	panel.add_child(v)
 	var title := _label("Victory!" if victory else "Defeat...", 20, Color("b8862a") if victory else Color("8a5a7a"))
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	if GS.title_font:
+		title.add_theme_font_override("font", GS.title_font)
 	v.add_child(title)
 	v.add_child(_label("Time %d:%02d" % [int(manager.elapsed) / 60, int(manager.elapsed) % 60], 9))
 	for line in report["lines"]:
@@ -358,6 +363,9 @@ func _show_results(victory: bool, report: Dictionary) -> void:
 	back.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	back.pressed.connect(func(): closed.emit())
 	v.add_child(back)
+	if "--demo-return" in OS.get_cmdline_user_args():  # tests: press Return automatically
+		await get_tree().create_timer(2.0).timeout
+		closed.emit()
 
 
 ## Floating platform made of the café's checker tiles under a night sky.

@@ -52,7 +52,7 @@ var hud_bar: ProgressBar
 var hud_day: Label
 var toast_box: VBoxContainer
 var overlay: Control
-var night_bar: VBoxContainer
+var night_bar: HBoxContainer
 var edit_bar: PanelContainer
 var edit_list: VBoxContainer
 var edit_hint: Label
@@ -79,6 +79,14 @@ var bob_t := 0.0
 var customer_sheets: Array[Texture2D] = []
 var theme_ui: Theme
 var kit := {}                   # ship-kit piece anchors (assets/ship/kit.json)
+
+# voyages
+var voyage: VoyageManager
+var clouds: CloudNode
+var voyage_panel: PanelContainer
+var voyage_title: Label
+var voyage_bar: ProgressBar
+var voyage_log_box: VBoxContainer
 
 # day cycle: "open" -> "closing" -> "night"
 var phase := "open"
@@ -108,7 +116,8 @@ func _ready() -> void:
 	sky.layer = -1
 	add_child(sky)
 	sky.add_child(BgNode.new())
-	sky.add_child(CloudNode.new())
+	clouds = CloudNode.new()
+	sky.add_child(clouds)
 	ship_root = Node2D.new()
 	add_child(ship_root)
 	camera = Camera2D.new()
@@ -175,11 +184,6 @@ func _ready() -> void:
 			prep_meal = GS.meals.size() - 1
 		_start_battle()
 		battle.manager.speed_mult = 2.0
-		if "--demo-return" in args:  # press "Return to Café" once results are up
-			while not battle.result_shown:
-				await get_tree().create_timer(0.5).timeout
-			await get_tree().create_timer(2.0).timeout
-			_end_battle()
 	if "--demo-board" in args:
 		await get_tree().create_timer(1.0).timeout
 		_open_board()
@@ -197,6 +201,22 @@ func _ready() -> void:
 	if "--demo-shop" in args:
 		await get_tree().create_timer(1.0).timeout
 		_open_shop()
+	if "--demo-voyage" in args:  # assign stations, top up, fly a route at night
+		var ks: Array = GS.staff.keys()
+		for i in mini(3, ks.size()):
+			GS.assign_station(["pilot", "engineer", "quartermaster"][i], ks[ks.size() - 1 - i])
+		GS.airship["fuel"] = int(ShipStats.stat("fuel_cap"))
+		phase = "night"
+		night_bar.visible = true
+		await get_tree().create_timer(1.0).timeout
+		if "--demo-routes" in args:
+			_open_routes()
+		else:
+			var rt: Dictionary = ShipStats.ROUTES[1]
+			_depart(rt, int(ShipStats.fuel_estimate(int(rt["segments"]))["fuel"]))
+	if "--demo-ship" in args:
+		await get_tree().create_timer(1.0).timeout
+		_open_ship()
 	if "--demo-pan" in args:  # glide the camera along the ship
 		var tw := create_tween()
 		tw.tween_property(camera, "position", camera.position + Vector2(160, 60), 3.0)
@@ -1092,7 +1112,7 @@ func _pay(c: Dictionary, food: String, tier: String) -> void:
 # ------------------------------------------------------------------ day cycle
 func _process(delta: float) -> void:
 	bob_t += delta
-	ship_root.position.y = round(sin(bob_t * 1.3) * 1.5)
+	ship_root.position.y = round(sin(bob_t * (2.2 if voyage else 1.3)) * (2.5 if voyage else 1.5))
 	var pan := Vector2(
 		float(Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT)) - float(Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT)),
 		float(Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN)) - float(Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP)))
@@ -1136,6 +1156,9 @@ func _start_night() -> void:
 
 
 func _open_cafe() -> void:
+	if voyage != null:
+		_toast("Land first - the ship is on a voyage.")
+		return
 	var missing: Array = []
 	for need in [["stove", "a stove"], ["counter", "a counter"]]:
 		if _station_list(need[0]).is_empty():
@@ -1255,11 +1278,11 @@ func _build_ui() -> void:
 
 	# side buttons
 	var side := VBoxContainer.new()
-	side.position = Vector2(6, 210)
+	side.position = Vector2(6, 182)
 	side.add_theme_constant_override("separation", 4)
 	root.add_child(side)
 	for pair in [["Menu", _open_menu], ["Staff", _open_staff], ["Summon", _open_summon], ["Shop", _open_shop],
-			["Battles", _open_board]]:
+			["Battles", _open_board], ["Ship", _open_ship]]:
 		var b := Button.new()
 		b.text = pair[0]
 		b.custom_minimum_size = Vector2(70, 24)
@@ -1273,8 +1296,8 @@ func _build_ui() -> void:
 	root.add_child(toast_box)
 
 	# night controls
-	night_bar = VBoxContainer.new()
-	night_bar.position = Vector2(6, 148)
+	night_bar = HBoxContainer.new()
+	night_bar.position = Vector2(374, 328)
 	night_bar.add_theme_constant_override("separation", 8)
 	night_bar.visible = false
 	root.add_child(night_bar)
@@ -1288,6 +1311,34 @@ func _build_ui() -> void:
 	ob.custom_minimum_size = Vector2(80, 26)
 	ob.pressed.connect(_open_cafe)
 	night_bar.add_child(ob)
+	var sb := Button.new()
+	sb.text = "Set Sail"
+	sb.custom_minimum_size = Vector2(80, 26)
+	sb.pressed.connect(_open_routes)
+	night_bar.add_child(sb)
+
+	# voyage progress
+	voyage_panel = PanelContainer.new()
+	voyage_panel.position = Vector2(200, 300)
+	voyage_panel.custom_minimum_size = Vector2(300, 0)
+	voyage_panel.visible = false
+	root.add_child(voyage_panel)
+	var vv := VBoxContainer.new()
+	vv.add_theme_constant_override("separation", 2)
+	voyage_panel.add_child(vv)
+	voyage_title = Label.new()
+	voyage_title.add_theme_font_size_override("font_size", 11)
+	vv.add_child(voyage_title)
+	voyage_bar = ProgressBar.new()
+	voyage_bar.show_percentage = false
+	voyage_bar.max_value = 1.0
+	voyage_bar.custom_minimum_size = Vector2(280, 7)
+	voyage_bar.add_theme_stylebox_override("fill", _sb(Color("7fd8ff"), Color("7fd8ff"), 0, 0))
+	vv.add_child(voyage_bar)
+	voyage_log_box = VBoxContainer.new()
+	voyage_log_box.add_theme_constant_override("separation", 0)
+	voyage_log_box.position = Vector2(200, 230)
+	root.add_child(voyage_log_box)
 
 	# edit mode: storage strip + hint
 	edit_bar = PanelContainer.new()
@@ -1377,6 +1428,8 @@ func _open_panel(title: String, size := Vector2(420, 290)) -> VBoxContainer:
 	var tl := Label.new()
 	tl.text = title
 	tl.add_theme_font_size_override("font_size", 16)
+	if GS.title_font:
+		tl.add_theme_font_override("font", GS.title_font)
 	tl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	head.add_child(tl)
 	var x := Button.new()
@@ -1385,6 +1438,7 @@ func _open_panel(title: String, size := Vector2(420, 290)) -> VBoxContainer:
 	x.pressed.connect(_close_panel)
 	head.add_child(x)
 	v.add_child(head)
+	_fit_panel(panel, size)
 	return v
 
 
@@ -1406,6 +1460,25 @@ func _close_panel() -> void:
 		ch.queue_free()
 
 
+## The pixel font is wider than a vector font: after the panel lays out, any
+## label crossing the panel's right edge wraps to fit (two passes, since
+## wrapping moves things), then the panel snaps back to its intended size.
+func _fit_panel(panel: Control, size: Vector2) -> void:
+	for pass_i in 2:
+		await get_tree().process_frame
+		if not is_instance_valid(panel):
+			return
+		var limit := panel.global_position.x + size.x - 14.0
+		for l in panel.find_children("*", "Label", true, false):
+			var right: float = l.global_position.x + l.size.x
+			var avail: float = limit - l.global_position.x
+			if right > limit and avail > 40.0:
+				l.autowrap_mode = TextServer.AUTOWRAP_WORD
+				l.custom_minimum_size.x = avail
+				l.size_flags_horizontal = Control.SIZE_FILL
+		panel.size = size
+
+
 func _small_label(text: String, size: int = 10) -> Label:
 	var l := Label.new()
 	l.text = text
@@ -1415,7 +1488,7 @@ func _small_label(text: String, size: int = 10) -> Label:
 
 # ---- menu
 func _open_menu() -> void:
-	var list := _scroll(_open_panel("Menu"))
+	var list := _scroll(_open_panel("Menu", Vector2(560, 300)))
 	var legend := HBoxContainer.new()
 	legend.add_theme_constant_override("separation", 3)
 	for tier in GS.TIERS:
@@ -1902,6 +1975,8 @@ func _start_battle() -> void:
 		_set_editing(false)
 	var team: Array[String] = []
 	team.assign(prep_team)
+	if voyage == null:
+		GS.battle_party = team.duplicate()
 	battle = BattleScene.new(prep_enc, team, meal, theme_ui)
 	battle.closed.connect(_end_battle)
 	add_child(battle)
@@ -1910,12 +1985,302 @@ func _start_battle() -> void:
 
 
 func _end_battle() -> void:
+	var won: bool = battle.victory
 	battle.queue_free()
 	battle = null
 	get_tree().paused = false
 	ui.visible = true
 	_refresh_hud()
-	_toast("Back at the café.")
+	if voyage != null and voyage.waiting:
+		voyage.resume(won)
+	else:
+		_toast("Back at the café.")
+
+
+# ---- airship: status, stations, upgrades, supplies
+func _open_ship() -> void:
+	var v := _open_panel("The Sky Café Airship", Vector2(480, 310))
+	var list := _scroll(v)
+	var a: Dictionary = GS.airship
+
+	# status bars
+	var bars := GridContainer.new()
+	bars.columns = 3
+	bars.add_theme_constant_override("h_separation", 6)
+	list.add_child(bars)
+	for row in [["Hull", float(a["hull"]), ShipStats.stat("hull"), Color("6cd46a")],
+			["Aether Fuel", float(a["fuel"]), ShipStats.stat("fuel_cap"), Color("7fd8ff")],
+			["Engine", float(a["engine"]), 100.0, Color("f2c14e")]]:
+		bars.add_child(_small_label(row[0], 10))
+		var pb := ProgressBar.new()
+		pb.show_percentage = false
+		pb.custom_minimum_size = Vector2(180, 7)
+		pb.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		pb.max_value = row[2]
+		pb.value = row[1]
+		pb.add_theme_stylebox_override("fill", _sb(row[3], row[3], 0, 0))
+		bars.add_child(pb)
+		bars.add_child(_small_label("%d / %d" % [row[1], row[2]], 9))
+
+	# ship stats
+	var cargo_bonus := ShipStats.quartermaster_cargo()
+	var stats := _small_label(("Engine Power %d    Fuel Efficiency %d%%    Stability %d (battle shield +%d)\n" +
+		"Cargo %d / %d slots%s    Crew %d / %d    Café seats %d    Voyages %d") % [
+		ShipStats.stat("engine"), int(round(ShipStats.stat("efficiency") * 100)), ShipStats.stat("stability"),
+		int(ShipStats.battle_shield()), ShipStats.cargo_used(), ShipStats.cargo_capacity(),
+		(" (Quartermaster +%d%%)" % int(round(cargo_bonus * 100))) if cargo_bonus > 0.0 else "",
+		GS.staff.size(), int(ShipStats.stat("crew")), seats.size(), int(a.get("voyages", 0))], 9)
+	list.add_child(stats)
+
+	# crew stations (travel shift, separate from café roles)
+	list.add_child(_small_label("Crew stations  (travel shift - performance = 0.65 primary + 0.35 secondary + 1.5 mastery)", 10))
+	var keys: Array = GS.staff.keys()
+	for st in ShipStats.STATIONS:
+		var d: Dictionary = ShipStats.STATIONS[st]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		row.add_child(_small_label("%s (%s+%s)" % [d["name"], GS.STAT_LABEL[d["p"]], GS.STAT_LABEL[d["s"]]], 9))
+		var ob := OptionButton.new()
+		ob.add_theme_font_size_override("font_size", 9)
+		ob.custom_minimum_size = Vector2(100, 0)
+		ob.add_item("- empty -")
+		for k in keys:
+			ob.add_item("%s Lv%d" % [GS.STAFF[k]["name"], GS.level(k)])
+		var cur := ShipStats.station_key(st)
+		ob.selected = keys.find(cur) + 1
+		ob.item_selected.connect(func(i: int):
+			GS.assign_station(st, "" if i == 0 else keys[i - 1])
+			_open_ship())
+		row.add_child(ob)
+		var perf := ShipStats.performance(cur, st)
+		var bonus := ""
+		match st:
+			"pilot":
+				bonus = "fuel -%d%%, speed +%d%%" % [int(round(ShipStats.pilot_fuel() * 100)), int(round(ShipStats.pilot_speed() * 100))]
+			"engineer":
+				bonus = "fuel -%d%%, repairs -%d%%" % [int(round(ShipStats.engineer_fuel() * 100)), int(round(ShipStats.engineer_repair() * 100))]
+			"quartermaster":
+				bonus = "cargo +%d%%" % int(round(ShipStats.quartermaster_cargo() * 100))
+		var ml := (" M%d" % GS.mastery_level(cur, d["mastery"])) if cur != "" else ""
+		if perf <= ShipStats.PERF_BASE:
+			bonus = "no bonus yet" if cur != "" else "assign someone"
+		row.add_child(_small_label("score %.1f%s -> %s" % [perf, ml, bonus], 9))
+		list.add_child(row)
+
+	# upgrades
+	list.add_child(_small_label("Upgrades", 10))
+	for id in ShipStats.data.upgrades:
+		var u: Dictionary = ShipStats.data.upgrades[id]
+		var lv := ShipStats.level(id)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 6)
+		var cost_text := ""
+		if lv < ShipStats.data.max_upgrade:
+			var c := ShipStats.data.upgrade_cost(lv + 1)
+			cost_text = "  (Lv%d: %d coins, %d mats)" % [lv + 1, c["coins"], c["mats"]]
+		var l := _small_label("%s Lv%d - %s%s" % [u["name"], lv, u["desc"], cost_text], 9)
+		l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(l)
+		var b := Button.new()
+		b.add_theme_font_size_override("font_size", 9)
+		if lv >= ShipStats.data.max_upgrade:
+			b.text = "Max"
+			b.disabled = true
+		else:
+			b.text = "Upgrade"
+			b.disabled = GS.ship_upgrade_block(id) != ""
+			b.tooltip_text = GS.ship_upgrade_block(id)
+		b.pressed.connect(func():
+			if GS.upgrade_ship(id):
+				_toast("%s upgraded!" % u["name"])
+			_open_ship())
+		row.add_child(b)
+		list.add_child(row)
+
+	# supplies at the anchorage
+	list.add_child(_small_label("Anchorage supplies  (Building Materials: %d, Aether Shards: %d)" % [
+		GS.mats(), int(GS.materials.get("aether_shards", 0))], 10))
+	var sup := HFlowContainer.new()
+	sup.add_theme_constant_override("h_separation", 4)
+	sup.add_theme_constant_override("v_separation", 4)
+	list.add_child(sup)
+	var room := int(ShipStats.stat("fuel_cap")) - GS.fuel()
+	for n in [5, room]:
+		if n <= 0:
+			continue
+		var fb := Button.new()
+		fb.text = ("Fill tank" if n == room else "Buy %d fuel" % n) + " (%d coins)" % (n * ShipStats.FUEL_PRICE)
+		fb.add_theme_font_size_override("font_size", 9)
+		fb.disabled = GS.coins < n * ShipStats.FUEL_PRICE
+		fb.pressed.connect(func():
+			GS.buy_fuel(n)
+			_open_ship())
+		sup.add_child(fb)
+	var rb := Button.new()
+	rb.text = "Refine %d shards -> %d fuel" % [ShipStats.SHARDS_PER_REFINE, ShipStats.refine_yield()]
+	rb.add_theme_font_size_override("font_size", 9)
+	rb.disabled = int(GS.materials.get("aether_shards", 0)) < ShipStats.SHARDS_PER_REFINE or room <= 0
+	rb.pressed.connect(func():
+		var made := GS.refine_shards()
+		if made > 0:
+			_toast("Refined %d Aether Fuel." % made)
+		_open_ship())
+	sup.add_child(rb)
+	var missing := int(ceil(ShipStats.stat("hull") - float(a["hull"])))
+	if missing > 0:
+		var rc := ShipStats.repair_cost(missing)
+		var hb := Button.new()
+		hb.text = "Repair hull (%d coins, %d mats)" % [rc["coins"], rc["mats"]]
+		hb.add_theme_font_size_override("font_size", 9)
+		hb.disabled = GS.coins < rc["coins"] or GS.mats() < rc["mats"]
+		hb.pressed.connect(func():
+			if GS.repair_hull():
+				_toast("Hull repaired.")
+			_open_ship())
+		sup.add_child(hb)
+	if float(a["engine"]) < 100.0:
+		var mb := Button.new()
+		mb.text = "Maintain engine (%d coins)" % ShipStats.maintain_cost()
+		mb.add_theme_font_size_override("font_size", 9)
+		mb.disabled = GS.coins < ShipStats.maintain_cost()
+		mb.pressed.connect(func():
+			if GS.maintain_engine():
+				_toast("Engine tuned up.")
+			_open_ship())
+		sup.add_child(mb)
+	if GS.mats() < 10:
+		var bm := Button.new()
+		bm.text = "Buy 5 Building Materials (%d coins)" % (GS.MATS_PRICE * 5)
+		bm.add_theme_font_size_override("font_size", 9)
+		bm.disabled = GS.coins < GS.MATS_PRICE * 5
+		bm.pressed.connect(func():
+			if GS.coins >= GS.MATS_PRICE * 5:
+				GS.coins -= GS.MATS_PRICE * 5
+				GS.add_material("build_mats", 5)
+				GS.save_game()
+			_open_ship())
+		sup.add_child(bm)
+
+
+# ---- Sky Routes (voyages leave and return to the home anchorage)
+func _open_routes() -> void:
+	if voyage != null:
+		return
+	var v := _open_panel("Set Sail - Sky Routes", Vector2(470, 300))
+	v.add_child(_small_label("Fuel %d / %d    Hull %d / %d    Engine %d%%    Voyages are flown at night; the café stays closed." % [
+		GS.fuel(), ShipStats.stat("fuel_cap"), GS.airship["hull"], ShipStats.stat("hull"), GS.airship["engine"]], 9))
+	var busy: Array = GS.airship["stations"].values()
+	var free: Array = GS.staff.keys().filter(func(k): return not k in busy)
+	v.add_child(_small_label("Ambush fighters (crew not at a station): %s" % (", ".join(free.map(func(k): return GS.STAFF[k]["name"])) if not free.is_empty() else "nobody free - station crew will fight"), 9))
+	var list := _scroll(v)
+	for route in ShipStats.ROUTES:
+		var est := ShipStats.fuel_estimate(int(route["segments"]))
+		var row := PanelContainer.new()
+		row.add_theme_stylebox_override("panel", _sb(Color("fff6ea"), C_EDGE, 2, 4))
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", 6)
+		row.add_child(hb)
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 2)
+		col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		col.add_child(_small_label("%s   %d segments, hazard %d, ~%ds" % [route["name"], route["segments"], route["hazard"],
+			int(ShipStats.voyage_seconds(int(route["segments"])))], 11))
+		col.add_child(_small_label(route["desc"], 8))
+		var enc := BattleDB.encounter(StringName(route["encounter"]))
+		col.add_child(_small_label("Ambush %d%%: %s    Rewards: %d-%d Aether Shards, %d coins%s" % [
+			int(float(route["ambush"]) * 100), enc.display_name, route["shards"][0], route["shards"][1], route["coins"],
+			(", %d mats" % route["mats"]) if int(route["mats"]) > 0 else ""], 8))
+		var fuel_line := "Fuel needed: %d  (base %.1f%s)" % [est["fuel"], est["base"],
+			("; " + ", ".join(est["notes"])) if not est["notes"].is_empty() else ""]
+		col.add_child(_small_label(fuel_line, 8))
+		hb.add_child(col)
+		var b := Button.new()
+		b.text = "Depart"
+		b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		var block := ""
+		if GS.fuel() < int(est["fuel"]):
+			block = "Not enough fuel"
+		elif float(GS.airship["hull"]) < ShipStats.stat("hull") * 0.2:
+			block = "Repair the hull first"
+		b.disabled = block != ""
+		b.tooltip_text = block
+		b.pressed.connect(func(): _depart(route, int(est["fuel"])))
+		hb.add_child(b)
+		list.add_child(row)
+
+
+## Fuel is deducted (and saved) at departure, so nothing mid-route can strand the ship.
+func _depart(route: Dictionary, fuel_cost: int) -> void:
+	if GS.fuel() < fuel_cost or voyage != null:
+		return
+	if editing:
+		_set_editing(false)
+	_close_panel()
+	GS.airship["fuel"] = GS.fuel() - fuel_cost
+	GS.save_game()
+	voyage = VoyageManager.new()
+	add_child(voyage)
+	voyage.progressed.connect(func(f: float): voyage_bar.value = f)
+	voyage.logged.connect(_voyage_log)
+	voyage.ambushed.connect(_voyage_ambush)
+	voyage.finished.connect(_voyage_done)
+	night_bar.visible = false
+	voyage_panel.visible = true
+	voyage_title.text = "Voyage: " + str(route["name"])
+	for ch in voyage_log_box.get_children():
+		ch.queue_free()
+	clouds.speed_mult = 8.0
+	voyage.start(route, fuel_cost)
+
+
+func _voyage_log(text: String, col: Color) -> void:
+	var l := _small_label(text, 9, )
+	l.add_theme_color_override("font_color", col)
+	l.add_theme_color_override("font_outline_color", Color("1c1428"))
+	l.add_theme_constant_override("outline_size", 3)
+	voyage_log_box.add_child(l)
+	while voyage_log_box.get_child_count() > 4:
+		voyage_log_box.get_child(0).free()
+
+
+## Ambush: the saved battle party fights; station crew are busy flying the ship.
+func _voyage_ambush(enc_id: String) -> void:
+	var busy: Array = GS.airship["stations"].values()
+	var team: Array[String] = []
+	for k in GS.battle_party:
+		if GS.staff.has(k) and not k in busy and team.size() < 3:
+			team.append(k)
+	if team.is_empty():
+		var pool: Array = GS.staff.keys().filter(func(k): return not k in busy)
+		if pool.is_empty():
+			pool = GS.staff.keys()
+		pool.sort_custom(func(x, y): return GS.level(x) > GS.level(y))
+		team.assign(pool.slice(0, 3))
+	prep_enc = BattleDB.encounter(StringName(enc_id))
+	prep_team = team
+	prep_meal = -1
+	_start_battle()
+
+
+func _voyage_done(report: Dictionary) -> void:
+	voyage.queue_free()
+	voyage = null
+	voyage_panel.visible = false
+	for ch in voyage_log_box.get_children():
+		ch.queue_free()
+	night_bar.visible = phase == "night"
+	clouds.speed_mult = 1.0
+	var v := _open_panel("Voyage Report - %s" % report["route"]["name"], Vector2(340, 240))
+	v.add_child(_small_label(("Completed!" if report["completed"] else "Turned back after %d segments." % report["segments"]), 13))
+	v.add_child(_small_label("Fuel used %d    Hull -%d (now %d/%d)    Engine wear -%d%%" % [report["fuel"], report["hull_lost"],
+		GS.airship["hull"], ShipStats.stat("hull"), int(report["wear"])], 9))
+	for line in report["lines"]:
+		v.add_child(_small_label(line, 11))
+	if not report["crew"].is_empty():
+		v.add_child(_small_label("Station mastery gained: " + ", ".join(report["crew"]), 9))
+	else:
+		v.add_child(_small_label("Tip: assign a Pilot, Engineer and Quartermaster in the Ship panel.", 9))
+	_refresh_hud()
 
 
 # ---- shop
@@ -1984,6 +2349,9 @@ func _item_blurb(item: String) -> String:
 
 # ---- edit mode (night only)
 func _set_editing(on: bool) -> void:
+	if on and voyage != null:
+		_toast("Can't rearrange while sailing.")
+		return
 	if on and phase != "night":
 		_toast("You can rearrange once the café closes for the night.")
 		return
@@ -2195,6 +2563,7 @@ class GridNode extends Node2D:
 ## Slowly drifting clouds behind the ship (screen space).
 class CloudNode extends Node2D:
 	var clouds: Array = []
+	var speed_mult := 1.0
 
 	func _ready() -> void:
 		var rng := RandomNumberGenerator.new()
@@ -2205,7 +2574,7 @@ class CloudNode extends Node2D:
 
 	func _process(delta: float) -> void:
 		for c in clouds:
-			c["pos"].x -= c["speed"] * delta
+			c["pos"].x -= c["speed"] * delta * speed_mult
 			if c["pos"].x < -120:
 				c["pos"].x = 760
 		queue_redraw()

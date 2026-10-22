@@ -121,7 +121,8 @@ const GROWTH := {"R": 0.06, "SR": 0.065, "SSR": 0.07}
 const MATERIALS := {
 	"golden_sugar": {"name": "Golden Sugar", "desc": "Next dish cooked is one star better"},
 	"training_manual": {"name": "Training Manual", "desc": "+120 XP to one character"},
-	"build_mats": {"name": "Building Materials", "desc": "Timber, stone and nails for town upgrades"},
+	"build_mats": {"name": "Building Materials", "desc": "Timber, metal and nails for repairs and upgrades"},
+	"aether_shards": {"name": "Aether Shards", "desc": "Raw Aether; an engineer refines it into fuel"},
 }
 const MANUAL_XP := 120
 ## ---- starting island: town buildings (the café itself lives on the ship) ----
@@ -180,10 +181,15 @@ var cleared: Dictionary = {}    # encounter id -> victories
 ## Island town. th = Town Hall level (single source); cafe = ship café level.
 ## buildings: [{id, x, y, level}] footprints on the island grid.
 var town: Dictionary = {}
-var battle_hp: Dictionary = {}  # crew key -> HP ratio carried between battles (reset each new day)
+var battle_hp: Dictionary = {}
+## Airship progress: fuel, hull, engine condition (0-100), upgrade levels and
+## crew stations (travel-shift assignments, separate from café roles).
+var airship: Dictionary = {}
+var battle_party: Array = []   ## last battle team, reused for voyage ambushes  # crew key -> HP ratio carried between battles (reset each new day)
 
 
 func _ready() -> void:
+	_setup_font()
 	if "--test-save" in OS.get_cmdline_user_args():
 		save_path = TEST_SAVE_PATH
 		if FileAccess.file_exists(SAVE_PATH):
@@ -215,6 +221,37 @@ func new_game() -> void:
 	cleared = {}
 	battle_hp = {}
 	town = default_town()
+	airship = default_airship()
+	battle_party = []
+
+
+## Game-wide pixel fonts (Pixel Operator, CC0, Jayvee Enaguas). Body text is
+## always drawn at its native 8 px and titles at the 16 px cut, so every glyph
+## lands on whole pixels whatever font size a control asks for.
+var title_font: FontFile
+
+
+func _pixel_font(path: String, px: int) -> FontFile:
+	var f := load(path) as FontFile
+	if f == null:
+		return null
+	f.antialiasing = TextServer.FONT_ANTIALIASING_NONE
+	f.hinting = TextServer.HINTING_NONE
+	f.subpixel_positioning = TextServer.SUBPIXEL_POSITIONING_DISABLED
+	f.fixed_size = px
+	f.fixed_size_scale_mode = TextServer.FIXED_SIZE_SCALE_DISABLE
+	return f
+
+
+func _setup_font() -> void:
+	title_font = _pixel_font("res://assets/fonts/PixelOperator.ttf", 16)
+	var f := _pixel_font("res://assets/fonts/PixelOperator8.ttf", 8)
+	if f == null:
+		return
+	ThemeDB.fallback_font = f
+	ThemeDB.fallback_font_size = 8
+	ThemeDB.get_default_theme().default_font = f
+	ThemeDB.get_default_theme().default_font_size = 8
 
 
 ## A crew member's permanent record. mastery (job -> XP) and bond are
@@ -375,6 +412,114 @@ func use_material(id: String) -> bool:
 		materials.erase(id)
 	changed.emit()
 	return true
+
+
+# ------------------------------------------------------------------ airship
+func default_airship() -> Dictionary:
+	return {
+		"fuel": 20, "hull": 100.0, "engine": 100.0,
+		"upgrades": {"core": 1, "tank": 1, "hull": 1, "runes": 1, "hold": 1},
+		"stations": {"pilot": "", "engineer": "", "quartermaster": ""},
+		"voyages": 0,
+	}
+
+
+func fuel() -> int:
+	return int(airship["fuel"])
+
+
+func buy_fuel(n: int) -> bool:
+	var room := int(ShipStats.stat("fuel_cap")) - fuel()
+	n = mini(n, room)
+	if n <= 0 or coins < n * ShipStats.FUEL_PRICE:
+		return false
+	coins -= n * ShipStats.FUEL_PRICE
+	airship["fuel"] = fuel() + n
+	changed.emit()
+	save_game()
+	return true
+
+
+## Engineer refines Aether Shards into fuel.
+func refine_shards() -> int:
+	if int(materials.get("aether_shards", 0)) < ShipStats.SHARDS_PER_REFINE:
+		return 0
+	var room := int(ShipStats.stat("fuel_cap")) - fuel()
+	var made := mini(ShipStats.refine_yield(), room)
+	if made <= 0:
+		return 0
+	materials["aether_shards"] = int(materials["aether_shards"]) - ShipStats.SHARDS_PER_REFINE
+	if materials["aether_shards"] <= 0:
+		materials.erase("aether_shards")
+	airship["fuel"] = fuel() + made
+	changed.emit()
+	save_game()
+	return made
+
+
+func repair_hull() -> bool:
+	var missing := int(ceil(ShipStats.stat("hull") - float(airship["hull"])))
+	if missing <= 0:
+		return false
+	var c := ShipStats.repair_cost(missing)
+	if coins < int(c["coins"]) or mats() < int(c["mats"]):
+		return false
+	coins -= int(c["coins"])
+	materials["build_mats"] = mats() - int(c["mats"])
+	airship["hull"] = ShipStats.stat("hull")
+	var eng := ShipStats.station_key("engineer")
+	if eng != "":
+		add_mastery(eng, "Engineer", 2)
+	changed.emit()
+	save_game()
+	return true
+
+
+func maintain_engine() -> bool:
+	var cost := ShipStats.maintain_cost()
+	if float(airship["engine"]) >= 100.0 or coins < cost:
+		return false
+	coins -= cost
+	airship["engine"] = 100.0
+	var eng := ShipStats.station_key("engineer")
+	if eng != "":
+		add_mastery(eng, "Engineer", 2)
+	changed.emit()
+	save_game()
+	return true
+
+
+func ship_upgrade_block(id: String) -> String:
+	var lv := ShipStats.level(id)
+	if lv >= ShipStats.data.max_upgrade:
+		return "Max level."
+	var c := ShipStats.data.upgrade_cost(lv + 1)
+	if coins < int(c["coins"]) or mats() < int(c["mats"]):
+		return "Needs %d coins and %d Building Materials." % [c["coins"], c["mats"]]
+	return ""
+
+
+func upgrade_ship(id: String) -> bool:
+	if ship_upgrade_block(id) != "":
+		return false
+	var lv := ShipStats.level(id)
+	var c := ShipStats.data.upgrade_cost(lv + 1)
+	coins -= int(c["coins"])
+	materials["build_mats"] = mats() - int(c["mats"])
+	airship["upgrades"][id] = lv + 1
+	if id == "hull":
+		airship["hull"] = float(airship["hull"]) + float(ShipStats.data.upgrades["hull"]["gain"]["hull"])
+	changed.emit()
+	save_game()
+	return true
+
+
+func assign_station(st: String, key: String) -> void:
+	for other in airship["stations"]:  # one station per crew member
+		if airship["stations"][other] == key:
+			airship["stations"][other] = ""
+	airship["stations"][st] = key
+	save_game()
 
 
 # ------------------------------------------------------------------ town
@@ -734,7 +879,7 @@ func save_game() -> void:
 		"served_total": served_total, "version": 5, "ship": ship,
 		"day": day, "placed": placed, "inventory": inventory,
 		"meals": meals, "tickets": tickets, "materials": materials, "cleared": cleared,
-		"battle_hp": battle_hp, "town": town,
+		"battle_hp": battle_hp, "town": town, "airship": airship, "battle_party": battle_party,
 	}
 	var f := FileAccess.open(save_path, FileAccess.WRITE)
 	if f:
@@ -776,6 +921,18 @@ func load_game() -> bool:
 			materials[k] = int(mats[k])
 	cleared = d.get("cleared", {})
 	battle_hp = d.get("battle_hp", {})
+	airship = default_airship()
+	var ap: Dictionary = d.get("airship", {})
+	for k in ["fuel", "hull", "engine", "voyages"]:
+		if ap.has(k):
+			airship[k] = ap[k]
+	for k in ap.get("upgrades", {}):
+		if airship["upgrades"].has(k):
+			airship["upgrades"][k] = clampi(int(ap["upgrades"][k]), 1, 5)
+	for k in ap.get("stations", {}):
+		if airship["stations"].has(k) and str(ap["stations"][k]) in d.get("staff", {}):
+			airship["stations"][k] = str(ap["stations"][k])
+	battle_party = d.get("battle_party", [])
 	town = default_town()
 	var tw: Dictionary = d.get("town", {})
 	if not tw.is_empty():
