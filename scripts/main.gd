@@ -63,6 +63,7 @@ var edit_hint: Label
 var furn_nodes: Array = []      # sprites of placed items
 var occupied := {}              # Vector2i -> index into GS.placed (solid items)
 var rug_at := {}                # Vector2i -> index into GS.placed (rugs)
+var wall_at := {}               # Vector3i(c, r, rot) -> index into GS.placed (edge walls)
 var seats: Array = []           # {tile, dir, table, taken, dirty, plate, cleaning}
 var stations := {}              # kind -> Array[Vector2i]
 var station_busy := {}          # Vector2i -> staff key
@@ -133,7 +134,6 @@ func _ready() -> void:
 	world.y_sort_enabled = true
 	ship_root.add_child(world)
 	_build_front_rails()
-	_build_front_walls()
 	fx = Node2D.new()
 	fx.z_index = 50
 	ship_root.add_child(fx)
@@ -287,9 +287,10 @@ func _deck_tiles_sorted() -> Array:
 
 
 func _build_ship() -> void:
-	var f := FileAccess.open("res://assets/ship/kit.json", FileAccess.READ)
-	if f:
-		kit = JSON.parse_string(f.get_as_text())
+	for path in ["res://assets/ship/kit.json", "res://assets/walls/walls.json"]:
+		var f := FileAccess.open(path, FileAccess.READ)
+		if f:
+			kit.merge(JSON.parse_string(f.get_as_text()), true)
 	var C := COLS
 	var R := ROWS
 	var v := func(c: int, r: int, corner: String) -> Vector2:
@@ -318,20 +319,13 @@ func _build_ship() -> void:
 	_kit_at("stern", v.call(0, R - 1, "left") + Vector2(-6, -6), -11, Vector2(0.5, 0.0))
 	_kit_at("propeller", v.call(0, R - 1, "left") + Vector2(-24, 40), -11, Vector2(0.5, 0.5), true)
 	_kit_at("propeller", v.call(C - 1, 0, "right") + Vector2(18, 40), -11, Vector2(0.5, 0.5))
-	# cabin back walls with arched windows
-	for c in range(cabin.position.x, cabin.end.x - 1, 2):
-		_kit_edge("wall_window_a", "bottom", v.call(c, cabin.position.y, "top"),
-			v.call(c + 1, cabin.position.y, "right"), -15)
-	for r in range(cabin.position.y, cabin.end.y - 1, 2):
-		_kit_edge("wall_window_b", "bottom", v.call(cabin.position.x, r + 1, "left"),
-			v.call(cabin.position.x, r, "top"), -15)
 	var corner: Vector2 = v.call(cabin.position.x, cabin.position.y, "top")
 	_kit_at("dome", corner + Vector2(0, -74), -14, Vector2(0.5, 1.0))
 	_kit_at("awning", v.call(cabin.end.x - 1, cabin.position.y, "right") + Vector2(-8, -40), -13, Vector2(0.5, 0.5))
-	# back railings beyond the cabin
-	for c in range(cabin.end.x, C - 1, 2):
+	# back railings all round (walls placed against them stand in front)
+	for c in range(0, C - 1, 2):
 		_kit_edge("rail_a", "bottom", v.call(c, 0, "top"), v.call(c + 1, 0, "right"), -11)
-	for r in range(cabin.end.y, R - 1, 2):
+	for r in range(0, R - 1, 2):
 		_kit_edge("rail_a", "bottom", v.call(0, r, "top"), v.call(0, r + 1, "left"), -11)
 	# deck floor: cabin checker inside, planks outside
 	var wood := tex("res://assets/cafe/floor_wood.png")
@@ -369,45 +363,56 @@ func _build_front_rails() -> void:
 	_kit_at("gangway", gate + Vector2(-22, 22), 0, Vector2(0.5, 0.5), true, true)
 
 
-## Cabin front edges as [inside tile, outside tile]. doors = only the open ones,
-## otherwise only the walled ones.
-func _cabin_front_edges(doors: bool) -> Array:
-	var out: Array = []
-	var open := {}
-	for d in GS.ship.get("doors", []):
-		open[Vector2i(int(d[0]), int(d[1]))] = true
-	var r := cabin.end.y - 1
-	for c in range(cabin.position.x, cabin.end.x):
-		var t := Vector2i(c, r)
-		if deck.has(t + Vector2i(0, 1)) and open.has(t) == doors:
-			out.append([t, t + Vector2i(0, 1)])
-	var c2 := cabin.end.x - 1
-	for rr in range(cabin.position.y, cabin.end.y):
-		var t := Vector2i(c2, rr)
-		if deck.has(t + Vector2i(1, 0)) and not doors:
-			out.append([t, t + Vector2i(1, 0)])
-	return out
+## Two end points of a tile edge, ordered so the wall art (drawn running
+## down-right) maps onto it; down-left edges come out mirrored.
+func _edge_points(t: Vector2i, rot: int) -> Array:
+	var p := tile_pos(t)
+	var top := p + Vector2(0, -HH)
+	var right := p + Vector2(HW, 0)
+	var bottom := p + Vector2(0, HH)
+	var left := p + Vector2(-HW, 0)
+	match rot:
+		0: return [right, bottom]   # SE edge
+		1: return [left, bottom]    # SW edge
+		2: return [top, left]       # NW edge
+	return [top, right]             # NE edge
 
 
-## Full-height front walls of the café room (window wall pieces from the kit),
-## y-sorted with the furniture. Door gaps follow GS.ship["doors"].
-func _build_front_walls() -> void:
-	front_walls.clear()
-	var open := {}
-	for d in GS.ship.get("doors", []):
-		open[Vector2i(int(d[0]), int(d[1]))] = true
-	var r := cabin.end.y - 1
-	for c in range(cabin.position.x, cabin.end.x - 1, 2):
-		if open.has(Vector2i(c, r)) or open.has(Vector2i(c + 1, r)):
-			continue
-		var a := tile_pos(Vector2i(c, r)) + Vector2(-HW, 0)
-		var b := tile_pos(Vector2i(c + 1, r)) + Vector2(0, HH)
-		front_walls.append(_kit_edge("wall_window_a", "bottom", a, b, 0, true))
-	var c2 := cabin.end.x - 1
-	for rr in range(cabin.position.y, cabin.end.y - 1, 2):
-		var a := tile_pos(Vector2i(c2, rr)) + Vector2(HW, 0)
-		var b := tile_pos(Vector2i(c2, rr + 1)) + Vector2(0, HH)
-		front_walls.append(_kit_edge("wall_window_a", "bottom", a, b, 0, true))
+func _wall_node(item: String, t: Vector2i, rot: int) -> Node2D:
+	var e := _edge_points(t, rot)
+	var name: String = GS.ITEMS[item].get("tex", "walls/" + item).get_file()
+	if name == "wall_post":  # a post stands on the edge's first corner, not stretched along it
+		var holder := Node2D.new()
+		holder.position = (e[0] as Vector2).round() + Vector2(0, 1)
+		var spr := Sprite2D.new()
+		spr.texture = tex("res://assets/walls/wall_post.png")
+		spr.centered = false
+		spr.offset = Vector2(-spr.texture.get_width() / 2.0, -spr.texture.get_height()).round()
+		holder.add_child(spr)
+		world.add_child(holder)
+		return holder
+	return _kit_edge(name, "bottom", e[0], e[1], 0, true)
+
+
+## Wall under the mouse: the edge midpoint closest to the cursor (within 12 px).
+func _wall_near_mouse() -> int:
+	var m := ship_root.get_local_mouse_position()
+	var best := -1
+	var best_d := 12.0
+	for k in wall_at:
+		var e := _edge_points(Vector2i(k.x, k.y), k.z)
+		var mid: Vector2 = (e[0] + e[1]) / 2.0 + Vector2(0, -20)  # aim at the wall's middle, not its base
+		var d := m.distance_to(mid)
+		if d < best_d:
+			best_d = d
+			best = wall_at[k]
+	return best
+
+
+## The same physical edge seen from the neighbouring tile.
+func _same_edge(t: Vector2i, rot: int) -> Vector3i:
+	var n: Vector2i = t + ROT_DIRS[rot]
+	return Vector3i(n.x, n.y, (rot + 2) % 4)
 
 
 ## Front walls are solid from outside but fade while you edit, point the
@@ -425,6 +430,8 @@ func _fade_walls(delta: float) -> void:
 ## right-hand end the piece comes out mirrored (other side of the ship).
 func _kit_edge(piece: String, edge: String, a: Vector2, b: Vector2, z: int, sorted := false) -> Node2D:
 	var t := tex("res://assets/ship/%s.png" % piece)
+	if t == null:
+		t = tex("res://assets/walls/%s.png" % piece)
 	if t == null or not kit.has(piece):
 		return null
 	var m: Array = kit[piece][edge]
@@ -508,6 +515,8 @@ func _item_look(item: String, rot: int) -> Array:
 
 
 func _rotations(item: String) -> int:
+	if _kind(item) == "wall":
+		return 4  # one per tile edge
 	return 4 if ResourceLoader.exists(GS.item_tex_path(item).replace(".png", "_back.png")) else 2
 
 
@@ -533,11 +542,11 @@ func _apply_layout() -> void:
 	furn_nodes.clear()
 	occupied.clear()
 	rug_at.clear()
+	wall_at.clear()
+	front_walls.clear()
 	stations.clear()
 	astar.fill_solid_region(astar.region, false)
 	astar.clear_walls()
-	for w in _cabin_front_edges(false):  # cabin walls block movement except at doors
-		astar.set_wall(w[0], w[1])
 	for c in COLS:
 		for r in ROWS:
 			if not deck.has(Vector2i(c, r)):
@@ -545,6 +554,16 @@ func _apply_layout() -> void:
 	for i in GS.placed.size():
 		var p: Dictionary = GS.placed[i]
 		var t := Vector2i(p["c"], p["r"])
+		if _kind(p["item"]) == "wall":
+			var holder := _wall_node(p["item"], t, int(p["rot"]))
+			if holder:
+				furn_nodes.append(holder)
+				if int(p["rot"]) <= 1:
+					front_walls.append(holder)  # faces the camera: fades
+			wall_at[Vector3i(t.x, t.y, int(p["rot"]))] = i
+			if GS.ITEMS[p["item"]].get("blocks", true):
+				astar.set_wall(t, t + ROT_DIRS[int(p["rot"])])
+			continue
 		var s := _make_sprite(p["item"], p["rot"], t)
 		if _kind(p["item"]) == "rug":
 			rug_layer.add_child(s)
@@ -2407,6 +2426,7 @@ func _item_blurb(item: String) -> String:
 		"table": return "Chairs facing it = seats"
 		"chair": return "Face it toward a table"
 		"rug": return "Walkable, ambience +1"
+		"wall": return "Goes on a tile edge; R turns it" if GS.ITEMS[item].get("blocks", true) else "Walk-through; R turns it"
 	return "Ambience +%d" % int(GS.ITEMS[item].get("ambience", 0))
 
 
@@ -2458,6 +2478,14 @@ Buy items in the Shop.", 9)
 
 
 func _pick_up(t: Vector2i) -> void:
+	var wi := _wall_near_mouse()
+	if wi >= 0:
+		var w: Dictionary = GS.placed[wi]
+		held = {"item": w["item"], "rot": w["rot"], "from": Vector2i(w["c"], w["r"])}
+		GS.placed.remove_at(wi)
+		_apply_layout()
+		_update_ghost()
+		return
 	var idx: int = occupied.get(t, rug_at.get(t, -1))
 	if idx < 0:
 		return
@@ -2473,7 +2501,21 @@ func _pick_up(t: Vector2i) -> void:
 
 
 func _can_place(t: Vector2i) -> bool:
-	if held.is_empty() or not in_room(t) or t == DOOR:
+	if held.is_empty() or not in_room(t):
+		return false
+	if _kind(held["item"]) == "wall":
+		var rot: int = held["rot"]
+		if wall_at.has(Vector3i(t.x, t.y, rot)) or wall_at.has(_same_edge(t, rot)):
+			return false
+		if not GS.ITEMS[held["item"]].get("blocks", true):
+			return true
+		var n: Vector2i = t + ROT_DIRS[rot]
+		astar.set_wall(t, n)  # try it, then undo
+		var ok := layout_ok()
+		astar.walls.erase(astar._key(t, n))
+		astar.dirty = true
+		return ok
+	if t == DOOR:
 		return false
 	if _kind(held["item"]) == "rug":
 		return not rug_at.has(t)
@@ -2530,7 +2572,20 @@ func _update_ghost() -> void:
 	if held.is_empty():
 		ghost.visible = false
 		return
-	var s := _make_sprite(held["item"], held["rot"], hover if in_room(hover) else Vector2i(3, 3))
+	var at := hover if in_room(hover) else Vector2i(3, 3)
+	if _kind(held["item"]) == "wall":  # preview the wall on the hovered tile's edge
+		var holder := _wall_node(held["item"], at, int(held["rot"]))
+		var spr: Sprite2D = holder.get_child(0)
+		ghost.texture = spr.texture
+		ghost.flip_h = false
+		ghost.offset = spr.offset
+		ghost.transform = Transform2D(spr.transform.x, spr.transform.y, holder.position + spr.transform.origin)
+		holder.free()
+		ghost.visible = true
+		ghost.modulate = Color(0.6, 1, 0.6, 0.8) if _can_place(hover) else Color(1, 0.5, 0.5, 0.7)
+		return
+	ghost.transform = Transform2D.IDENTITY
+	var s := _make_sprite(held["item"], held["rot"], at)
 	ghost.texture = s.texture
 	ghost.flip_h = s.flip_h
 	ghost.offset = s.offset

@@ -95,6 +95,13 @@ const ITEMS := {
 	"chalkboard":      {"name": "Menu Board",      "kind": "deco",     "cost": 60, "ambience": 2},
 	"trash":           {"name": "Trash Bin",       "kind": "deco",     "cost": 25, "ambience": 0},
 	"rug":             {"name": "Rug",             "kind": "rug",      "cost": 50, "ambience": 1},
+	# walls sit on one EDGE of a tile (rot picks the edge); doorways and posts don't block
+	"wall_plain":      {"name": "Wall",            "kind": "wall",     "cost": 30, "tex": "walls/wall_plain"},
+	"wall_art":        {"name": "Wall (painting)", "kind": "wall",     "cost": 45, "ambience": 1, "tex": "walls/wall_art"},
+	"wall_window":     {"name": "Wall (window)",   "kind": "wall",     "cost": 50, "ambience": 1, "tex": "walls/wall_window"},
+	"wall_shelf":      {"name": "Wall (cup shelf)", "kind": "wall",    "cost": 50, "ambience": 1, "tex": "walls/wall_shelf"},
+	"wall_door":       {"name": "Doorway",         "kind": "wall",     "cost": 60, "blocks": false, "tex": "walls/wall_door"},
+	"wall_post":       {"name": "Corner Post",     "kind": "wall",     "cost": 15, "blocks": false, "tex": "walls/wall_post"},
 }
 
 const DAY_LENGTH := 150.0   # seconds the café is open each day
@@ -842,11 +849,34 @@ func default_layout(_tables: int = 0) -> Array:
 	add.call("table_round", 1, 4, 0)
 	add.call("chair", 2, 4, 2)
 	add.call("chair", 1, 5, 3)
+	_add_cabin_walls(out)
 	add.call("lamp", 11, 3, 0)
 	add.call("plant", 11, 5, 0)
 	add.call("fern", 0, 5, 0)
 	add.call("chalkboard", 5, 5, 1)
 	return out
+
+
+## Café-room walls as wall items: back walls inside, front walls with a doorway.
+## rot = which edge of the tile: 0 = SE, 1 = SW (front), 2 = NW, 3 = NE (back).
+func _add_cabin_walls(out: Array) -> void:
+	var cab: Array = SHIP_CABIN
+	var back := ["wall_window", "wall_plain", "wall_shelf", "wall_plain", "wall_art", "wall_window", "wall_plain", "wall_shelf"]
+	for i in int(cab[2]):
+		out.append({"item": back[i % back.size()], "c": int(cab[0]) + i, "r": int(cab[1]), "rot": 3})
+	for i in int(cab[3]):
+		out.append({"item": "wall_window" if i % 2 == 0 else "wall_plain", "c": int(cab[0]), "r": int(cab[1]) + i, "rot": 2})
+	var doors := {}
+	for d in SHIP_CABIN_DOORS:
+		doors[Vector2i(int(d[0]), int(d[1]))] = true
+	var fr := int(cab[1]) + int(cab[3]) - 1
+	for i in int(cab[2]):
+		var t := Vector2i(int(cab[0]) + i, fr)
+		out.append({"item": "wall_door" if doors.has(t) else ("wall_window" if i % 3 == 1 else "wall_plain"),
+			"c": t.x, "r": t.y, "rot": 1})
+	var fc := int(cab[0]) + int(cab[2]) - 1
+	for i in int(cab[3]):
+		out.append({"item": "wall_window" if i % 2 == 1 else "wall_plain", "c": fc, "r": int(cab[1]) + i, "rot": 0})
 
 
 ## Moving from the old one-room café to the ship: rebuild the starting
@@ -915,7 +945,7 @@ func save_game() -> void:
 	var data := {
 		"coins": coins, "gems": gems, "rep_level": rep_level, "rep_xp": rep_xp,
 		"unlocked": unlocked, "staff": staff,
-		"served_total": served_total, "version": 7, "ship": ship,
+		"served_total": served_total, "version": 8, "ship": ship,
 		"day": day, "placed": placed, "inventory": inventory,
 		"meals": meals, "tickets": tickets, "materials": materials, "cleared": cleared,
 		"battle_hp": battle_hp, "town": town, "airship": airship, "battle_party": battle_party,
@@ -1007,6 +1037,12 @@ func load_game() -> bool:
 		staff = {"hana": new_member("Chef")}
 	if int(d.get("version", 1)) < 7:  # re-arrange into the café layout (extras go to storage)
 		migrate_to_ship(placed)
+	if int(d.get("version", 1)) < 8:  # walls became placeable items
+		var has_walls := false
+		for p in placed:
+			has_walls = has_walls or ITEMS[p["item"]]["kind"] == "wall"
+		if not has_walls:
+			_add_cabin_walls(placed)
 	_store_off_deck()
 	return true
 
