@@ -24,15 +24,40 @@ const FOODS := {
 	"ramen":      {"name": "Ramen",            "price": 55, "cook": 10.0, "unlock": 950},
 }
 
-## Gacha pool. cook = cooking speed multiplier, serve = walk speed multiplier,
-## charm = tip fraction. Mostly humans; a couple of rare supernaturals.
+const DRINKS := ["coffee", "latte", "matcha", "melon_soda"]
+
+## Core stats. Café: TEC food quality, AGI cook/serve speed, END stamina,
+## HOS satisfaction + tips, FOC fewer mistakes on complex recipes.
+## Battle (later): TEC damage, AGI attack speed/dodge, END HP/defense,
+## HOS healing/shields/buffs, FOC crit/effect accuracy.
+const STATS := ["tec", "agi", "end", "hos", "foc"]
+const STAT_LABEL := {"tec": "TEC", "agi": "AGI", "end": "END", "hos": "HOS", "foc": "FOC"}
+const JOBS := ["Chef", "Barista", "Waiter", "Hostess", "Cleaner", "Rest"]
+const JOB_STATS := {
+	"Chef": ["tec", "foc"], "Barista": ["tec", "hos"], "Waiter": ["agi", "hos"],
+	"Hostess": ["hos", "foc"], "Cleaner": ["agi", "end"], "Rest": [],
+}
+
+## Dish quality tiers, worst to best.
+const TIERS := ["black", "plain", "bronze", "silver", "gold", "diamond"]
+const TIER_NAME := {"black": "Burnt", "plain": "Plain", "bronze": "Bronze", "silver": "Silver", "gold": "Gold", "diamond": "Diamond"}
+const TIER_PRICE := {"black": 0.3, "plain": 0.8, "bronze": 1.0, "silver": 1.25, "gold": 1.6, "diamond": 2.2}
+const TIER_REP := {"black": 0, "plain": 1, "bronze": 1, "silver": 2, "gold": 3, "diamond": 5}
+
+## Gacha pool. Mostly humans; a couple of rare supernaturals.
 const STAFF := {
-	"hana":      {"name": "Hana",      "title": "Apprentice Chef",       "rarity": "SR",  "sheet": "chef",      "cook": 1.3, "serve": 1.0, "charm": 0.05},
-	"leo":       {"name": "Leo",       "title": "Rookie Waiter",         "rarity": "R",   "sheet": "leo",       "cook": 0.9, "serve": 1.2, "charm": 0.05},
-	"mira":      {"name": "Mira",      "title": "Barista",               "rarity": "R",   "sheet": "mira",      "cook": 1.15, "serve": 1.05, "charm": 0.08},
-	"kaito":     {"name": "Kaito",     "title": "Swordsman Pâtissier",   "rarity": "SR",  "sheet": "kaito",     "cook": 1.5, "serve": 1.15, "charm": 0.06},
-	"seraphine": {"name": "Seraphine", "title": "Royal Mage Hostess",    "rarity": "SSR", "sheet": "seraphine", "cook": 1.2, "serve": 1.4, "charm": 0.25},
-	"selene":    {"name": "Selene",    "title": "Vampire Bartender",     "rarity": "SSR", "sheet": "selene",    "cook": 1.7, "serve": 1.25, "charm": 0.18},
+	"hana":      {"name": "Hana",      "title": "Apprentice Chef",     "rarity": "SR",  "sheet": "chef",      "job": "Chef",
+		"stats": {"tec": 14, "agi": 10, "end": 11, "hos": 9, "foc": 12}},
+	"leo":       {"name": "Leo",       "title": "Rookie Waiter",       "rarity": "R",   "sheet": "leo",       "job": "Waiter",
+		"stats": {"tec": 6, "agi": 13, "end": 10, "hos": 11, "foc": 7}},
+	"mira":      {"name": "Mira",      "title": "Barista",             "rarity": "R",   "sheet": "mira",      "job": "Barista",
+		"stats": {"tec": 11, "agi": 8, "end": 8, "hos": 12, "foc": 10}},
+	"kaito":     {"name": "Kaito",     "title": "Swordsman Pâtissier", "rarity": "SR",  "sheet": "kaito",     "job": "Chef",
+		"stats": {"tec": 16, "agi": 13, "end": 14, "hos": 6, "foc": 15}},
+	"seraphine": {"name": "Seraphine", "title": "Royal Mage Hostess",  "rarity": "SSR", "sheet": "seraphine", "job": "Hostess",
+		"stats": {"tec": 12, "agi": 15, "end": 10, "hos": 21, "foc": 17}},
+	"selene":    {"name": "Selene",    "title": "Vampire Bartender",   "rarity": "SSR", "sheet": "selene",    "job": "Barista",
+		"stats": {"tec": 20, "agi": 14, "end": 17, "hos": 16, "foc": 18}},
 }
 const RATES := {"SSR": 0.05, "SR": 0.20, "R": 0.75}
 const PULL_COST := 100
@@ -106,7 +131,7 @@ func pull(count: int) -> Array:
 		var key: String = pool[randi() % pool.size()]
 		var is_new := not staff.has(key)
 		if is_new:
-			staff[key] = {"level": 1, "role": "Rest"}
+			staff[key] = {"level": 1, "role": STAFF[key]["job"]}
 		else:
 			staff[key]["level"] = min(int(staff[key]["level"]) + 1, 10)
 		results.append({"key": key, "new": is_new, "level": staff[key]["level"]})
@@ -115,12 +140,51 @@ func pull(count: int) -> Array:
 	return results
 
 
+## Stat value with level growth (+6% per level).
 func stat(key: String, s: String) -> float:
-	var base: float = STAFF[key][s]
+	var base: float = STAFF[key]["stats"][s]
 	var lv: int = staff[key]["level"]
-	if s == "charm":
-		return base + 0.02 * (lv - 1)
-	return base * (1.0 + 0.08 * (lv - 1))
+	return base * (1.0 + 0.06 * (lv - 1))
+
+
+## Speed multiplier from AGI (10 AGI = 1.0x).
+func agi_mult(key: String) -> float:
+	return 0.6 + stat(key, "agi") * 0.04
+
+
+func max_stamina(key: String) -> float:
+	return 60.0 + stat(key, "end") * 4.0
+
+
+## Stamina lost per second of work; END makes it slower.
+func stamina_drain(key: String) -> float:
+	return maxf(0.35, 1.3 - stat(key, "end") * 0.04)
+
+
+## 0 (easy) .. 6 (ramen): complex recipes punish low FOC.
+func difficulty(food: String) -> int:
+	return int(FOODS[food]["unlock"] / 150)
+
+
+## Roll a dish's star tier. Chefs: TEC + FOC. Baristas making drinks: TEC + HOS.
+func roll_quality(key: String, food: String, job: String, tired: bool) -> String:
+	var tec := stat(key, "tec")
+	var foc := stat(key, "foc")
+	var second := stat(key, "hos") if (job == "Barista" and food in DRINKS) else foc
+	var diff := difficulty(food)
+	var burn := clampf(0.22 - foc * 0.011 + diff * 0.02 + (0.1 if tired else 0.0), 0.02, 0.45)
+	if randf() < burn:
+		return "black"
+	var s := tec * 0.8 + second * 0.3 - diff + randf_range(-5.0, 5.0) - (3.0 if tired else 0.0)
+	if s < 9.0:
+		return "plain"
+	if s < 14.0:
+		return "bronze"
+	if s < 19.0:
+		return "silver"
+	if s < 24.0:
+		return "gold"
+	return "diamond"
 
 
 func add_coins(n: int) -> void:
@@ -178,7 +242,7 @@ func save_game() -> void:
 	var data := {
 		"coins": coins, "gems": gems, "rep_level": rep_level, "rep_xp": rep_xp,
 		"unlocked": unlocked, "staff": staff, "tables_owned": tables_owned,
-		"served_total": served_total,
+		"served_total": served_total, "version": 2,
 	}
 	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
 	if f:
@@ -203,7 +267,11 @@ func load_game() -> bool:
 	var s: Dictionary = d.get("staff", {})
 	for k in s:
 		if STAFF.has(k):
-			staff[k] = {"level": int(s[k]["level"]), "role": str(s[k]["role"])}
+			var role := str(s[k]["role"])
+			# v1 saves parked new pulls on Rest and only knew Chef/Waiter
+			if role not in JOBS or (int(d.get("version", 1)) < 2 and role == "Rest"):
+				role = STAFF[k]["job"]
+			staff[k] = {"level": int(s[k]["level"]), "role": role}
 	if staff.is_empty():
 		staff = {"hana": {"level": 1, "role": "Chef"}}
 	return true

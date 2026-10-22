@@ -1,5 +1,6 @@
 extends Node2D
-## Isometric café: customers arrive, order food, chefs cook, waiters serve.
+## Isometric café: customers arrive and order; chefs cook, baristas brew,
+## waiters serve, hostesses greet, cleaners clear tables. Dishes earn star tiers.
 ## Coins unlock menu items and tables; gems pull new staff from the gacha.
 
 const HW := 29            # half tile width (px)
@@ -17,9 +18,11 @@ const COUNTER := Vector2i(0, 3)
 const PICKUP := Vector2i(1, 3)
 const DISPLAY := Vector2i(0, 5)
 const PLANT := Vector2i(6, 5)
-const CHEF_IDLE := Vector2i(1, 2)
-const WAITER_IDLE := Vector2i(2, 3)
 const REST_SPOT := Vector2i(1, 5)
+const IDLE_SPOTS := {
+	"Chef": Vector2i(1, 2), "Barista": Vector2i(1, 4), "Waiter": Vector2i(2, 3),
+	"Hostess": Vector2i(6, 1), "Cleaner": Vector2i(2, 5), "Rest": REST_SPOT,
+}
 const TABLES: Array[Vector2i] = [Vector2i(3, 2), Vector2i(5, 2), Vector2i(3, 4), Vector2i(5, 4)]
 
 const C_TEXT := Color("4a2f2a")
@@ -44,6 +47,9 @@ var counter_dishes: Array = []  # Sprite2D on counter
 var customers: Array = []
 var orders: Array = []
 var staff_actors := {}
+var stamina := {}               # key -> current stamina
+var tired := {}                 # key -> bool
+var working := {}               # key -> bool (doing a task)
 var spawn_t := 3.0
 var save_t := 0.0
 var customer_sheets: Array[Texture2D] = []
@@ -70,6 +76,13 @@ func _ready() -> void:
 	GS.changed.connect(_refresh_hud)
 	_refresh_hud()
 	_toast("Welcome to the Midnight Voyage Café!")
+	# `godot -- --demo-staff` / `--demo-menu` open a panel (screenshots/tests)
+	if "--demo-staff" in OS.get_cmdline_user_args():
+		await get_tree().create_timer(3.0).timeout
+		_open_staff()
+	if "--demo-menu" in OS.get_cmdline_user_args():
+		await get_tree().create_timer(1.0).timeout
+		_open_menu()
 	# `godot -- --demo-summon` showcases a 10-pull (used for screenshots/tests)
 	if "--demo-summon" in OS.get_cmdline_user_args():
 		await get_tree().create_timer(1.0).timeout
@@ -255,88 +268,194 @@ func _spawn_staff(key: String) -> void:
 		return
 	var sheet := tex("res://assets/chars/%s.png" % GS.STAFF[key]["sheet"])
 	var a := make_actor(sheet, 4, REST_SPOT)
-	a.speed = 42.0 * GS.stat(key, "serve")
 	staff_actors[key] = a
+	stamina[key] = GS.max_stamina(key)
+	_update_speed(key)
 	_staff_loop(key)
 
 
+func is_tired(key: String) -> bool:
+	return tired.get(key, false)
+
+
+func _update_speed(key: String) -> void:
+	var a: Actor = staff_actors[key]
+	a.speed = 34.0 * GS.agi_mult(key) * (0.6 if is_tired(key) else 1.0)
+	a.modulate = Color(0.78, 0.78, 0.9) if is_tired(key) else Color.WHITE
+
+
+func _role(key: String) -> String:
+	return GS.staff[key]["role"]
+
+
+func _has_role(role: String) -> bool:
+	for k in staff_actors:
+		if GS.staff.has(k) and _role(k) == role:
+			return true
+	return false
+
+
+## What this staff member should do next. Each job has its own work first,
+## then covers for jobs nobody is assigned to.
 func _pick_task(key: String) -> Dictionary:
-	var role: String = GS.staff[key]["role"]
-	if role == "Rest":
-		return {}
-	var cook: Dictionary = {}
-	var deliver: Dictionary = {}
+	var food_order: Dictionary = {}
+	var drink_order: Dictionary = {}
+	var ready: Dictionary = {}
 	for o in orders:
-		if o["state"] == "waiting" and cook.is_empty():
-			cook = o
-		elif o["state"] == "ready" and deliver.is_empty():
-			deliver = o
-	var cooks := _count_role("Chef")
-	var waiters := _count_role("Waiter")
-	if role == "Chef":
-		if not cook.is_empty():
-			return {"type": "cook", "order": cook}
-		if waiters == 0 and not deliver.is_empty():
-			return {"type": "deliver", "order": deliver}
-	else:
-		if not deliver.is_empty():
-			return {"type": "deliver", "order": deliver}
-		if cooks == 0 and not cook.is_empty():
-			return {"type": "cook", "order": cook}
+		if o["state"] == "waiting":
+			if o["food"] in GS.DRINKS:
+				if drink_order.is_empty():
+					drink_order = o
+			elif food_order.is_empty():
+				food_order = o
+		elif o["state"] == "ready" and ready.is_empty():
+			ready = o
+	var greet: Dictionary = {}
+	for c in customers:
+		if c["state"] == "waiting" and not c.get("greeted", false) and not c.get("greeting", false):
+			greet = c
+			break
+	var dirty: Dictionary = {}
+	for i in GS.tables_owned:
+		for ch in tables[i]["chairs"]:
+			if ch.get("dirty", false) and not ch.get("cleaning", false):
+				dirty = ch
+				break
+		if not dirty.is_empty():
+			break
+	var no_chef := not _has_role("Chef")
+	var no_barista := not _has_role("Barista")
+	var no_waiter := not _has_role("Waiter")
+	var no_cleaner := not _has_role("Cleaner")
+	var cook_any := food_order if not food_order.is_empty() else drink_order
+	match _role(key):
+		"Chef":
+			if not food_order.is_empty():
+				return {"type": "cook", "order": food_order}
+			if no_barista and not drink_order.is_empty():
+				return {"type": "cook", "order": drink_order}
+			if no_waiter and not ready.is_empty():
+				return {"type": "deliver", "order": ready}
+		"Barista":
+			if not drink_order.is_empty():
+				return {"type": "cook", "order": drink_order}
+			if no_chef and not food_order.is_empty():
+				return {"type": "cook", "order": food_order}
+			if no_waiter and not ready.is_empty():
+				return {"type": "deliver", "order": ready}
+		"Waiter":
+			if not ready.is_empty():
+				return {"type": "deliver", "order": ready}
+			if no_cleaner and not dirty.is_empty():
+				return {"type": "clean", "chair": dirty}
+			if no_chef and no_barista and not cook_any.is_empty():
+				return {"type": "cook", "order": cook_any}
+		"Hostess":
+			if not greet.is_empty():
+				return {"type": "greet", "customer": greet}
+			if no_waiter and not ready.is_empty():
+				return {"type": "deliver", "order": ready}
+		"Cleaner":
+			if not dirty.is_empty():
+				return {"type": "clean", "chair": dirty}
+			if no_waiter and not ready.is_empty():
+				return {"type": "deliver", "order": ready}
 	return {}
-
-
-func _count_role(role: String) -> int:
-	var n := 0
-	for k in GS.staff:
-		if GS.staff[k]["role"] == role and staff_actors.has(k):
-			n += 1
-	return n
 
 
 func _staff_loop(key: String) -> void:
 	var a: Actor = staff_actors[key]
 	while is_instance_valid(a):
-		var task := _pick_task(key)
+		var task: Dictionary = {} if is_tired(key) else _pick_task(key)
 		if task.is_empty():
-			var role: String = GS.staff[key]["role"]
-			var idle := REST_SPOT if role == "Rest" else (CHEF_IDLE if role == "Chef" else WAITER_IDLE)
+			var idle: Vector2i = IDLE_SPOTS.get(_role(key), REST_SPOT)
+			if is_tired(key):
+				idle = REST_SPOT
 			if a.tile != idle:
 				await walk(a, idle)
 				a.face(Actor.Dir.SE)
 			await get_tree().create_timer(0.4).timeout
 			continue
-		if task["type"] == "cook":
-			await _do_cook(key, a, task["order"])
+		working[key] = true
+		match task["type"]:
+			"cook":
+				await _do_cook(key, a, task["order"])
+			"deliver":
+				await _do_deliver(key, a, task["order"])
+			"greet":
+				await _do_greet(key, a, task["customer"])
+			"clean":
+				await _do_clean(key, a, task["chair"])
+		working[key] = false
+
+
+## Stamina drains while working (END slows it); tired staff rest until 40%.
+func _tick_stamina(delta: float) -> void:
+	for key in staff_actors:
+		if not GS.staff.has(key):
+			continue
+		var mx := GS.max_stamina(key)
+		var s: float = stamina.get(key, mx)
+		if working.get(key, false):
+			s -= GS.stamina_drain(key) * delta
 		else:
-			await _do_deliver(key, a, task["order"])
+			s += (6.0 if _role(key) == "Rest" or is_tired(key) else 2.5) * delta
+		s = clampf(s, 0.0, mx)
+		stamina[key] = s
+		var was := is_tired(key)
+		if s <= 0.0:
+			tired[key] = true
+		elif s >= mx * 0.4:
+			tired[key] = false
+		if was != is_tired(key):
+			_update_speed(key)
+			if is_tired(key):
+				_float_text(staff_actors[key].position + Vector2(0, -80), "Tired...", Color("b8b8e0"))
 
 
-func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
-	o["state"] = "cooking"
-	await walk(a, COOK_SPOT)
-	a.face_tile(STOVE)
-	var food: Dictionary = GS.FOODS[o["food"]]
-	var dur: float = food["cook"] / GS.stat(key, "cook")
-	a.bubble.show_icon(tex("res://assets/food/small/%s.png" % o["food"]))
+func _work(a: Actor, dur: float, icon: Texture2D, col: Color) -> void:
+	a.bubble.show_icon(icon)
 	var t := 0.0
 	while t < dur:
 		await get_tree().process_frame
 		t += get_process_delta_time()
-		a.bubble.set_progress(t / dur, Color("f0a640"))
+		a.bubble.set_progress(t / dur, col)
 	a.bubble.visible = false
 	a.bubble.set_progress(-1)
+
+
+func _star(tier: String) -> Sprite2D:
+	var s := Sprite2D.new()
+	s.texture = tex("res://assets/ui/star_%s.png" % tier)
+	return s
+
+
+func _do_cook(key: String, a: Actor, o: Dictionary) -> void:
+	o["state"] = "cooking"
+	var drink: bool = o["food"] in GS.DRINKS
+	# baristas brew at the counter, everyone else cooks at the stove
+	var at_counter := drink and _role(key) == "Barista"
+	await walk(a, PICKUP if at_counter else COOK_SPOT)
+	a.face_tile(COUNTER if at_counter else STOVE)
+	var dur: float = GS.FOODS[o["food"]]["cook"] / GS.agi_mult(key) / (0.6 if is_tired(key) else 1.0)
+	await _work(a, dur, tex("res://assets/food/small/%s.png" % o["food"]), Color("f0a640"))
 	if o["customer"]["state"] != "waiting":
 		orders.erase(o)
 		return
-	await walk(a, PICKUP)
-	a.face_tile(COUNTER)
+	o["tier"] = GS.roll_quality(key, o["food"], _role(key), is_tired(key))
+	o["maker"] = key
+	if not at_counter:
+		await walk(a, PICKUP)
+		a.face_tile(COUNTER)
 	var dish := Sprite2D.new()
 	dish.texture = tex("res://assets/food/tiny/%s.png" % o["food"])
-	dish.position = tile_pos(COUNTER) + Vector2(-4 + counter_dishes.size() * 7, -30)
 	dish.z_index = 5
+	var badge := _star(o["tier"])
+	badge.position = Vector2(6, -8)
+	dish.add_child(badge)
 	fx.add_child(dish)
 	counter_dishes.append(dish)
+	_relayout_counter()
 	o["dish"] = dish
 	o["state"] = "ready"
 
@@ -365,11 +484,45 @@ func _do_deliver(key: String, a: Actor, o: Dictionary) -> void:
 	a.face_tile(chair["tile"])
 	c["state"] = "served"
 	c["server"] = key
+	c["tier"] = o["tier"]
+	c["maker"] = o["maker"]
+
+
+## Hostess welcome: more patience (HOS + FOC) and a satisfaction bonus.
+func _do_greet(key: String, a: Actor, c: Dictionary) -> void:
+	c["greeting"] = true
+	await walk(a, free_neighbor(c["chair"]["tile"], a.tile))
+	if c["state"] != "waiting":
+		return
+	a.face_tile(c["chair"]["tile"])
+	await _work(a, 1.2, tex("res://assets/gacha/sparkle.png"), Color("f08bd8"))
+	if c["state"] != "waiting":
+		return
+	var bonus := (GS.stat(key, "hos") + GS.stat(key, "foc")) * 0.8
+	c["patience"] += bonus
+	c["max_patience"] += bonus
+	c["greeted"] = true
+	c["satisfaction"] = 1.0 + (GS.stat(key, "hos") + GS.stat(key, "foc")) * 0.01
+
+
+## Clear a dirty seat. Cleaners (AGI + END) are faster than anyone covering.
+func _do_clean(key: String, a: Actor, chair: Dictionary) -> void:
+	chair["cleaning"] = true
+	await walk(a, free_neighbor(chair["tile"], a.tile))
+	a.face_tile(chair["tile"])
+	var skill := GS.agi_mult(key) * (0.7 + GS.stat(key, "end") * 0.03)
+	var dur := 3.0 / skill * (1.0 if _role(key) == "Cleaner" else 1.5) / (0.6 if is_tired(key) else 1.0)
+	await _work(a, dur, tex("res://assets/gacha/sparkle.png"), Color("8fd0f0"))
+	var plate: Node = chair.get("plate")
+	if is_instance_valid(plate):
+		plate.queue_free()
+	chair["dirty"] = false
+	chair["cleaning"] = false
 
 
 func _relayout_counter() -> void:
 	for i in counter_dishes.size():
-		counter_dishes[i].position = tile_pos(COUNTER) + Vector2(-4 + i * 7, -30)
+		counter_dishes[i].position = tile_pos(COUNTER) + Vector2(-6 + i * 8, -30)
 
 
 # ------------------------------------------------------------------ customers
@@ -377,7 +530,7 @@ func _free_chairs() -> Array:
 	var out: Array = []
 	for i in GS.tables_owned:
 		for ch in tables[i]["chairs"]:
-			if not ch["taken"]:
+			if not ch["taken"] and not ch.get("dirty", false):
 				out.append({"table": tables[i], "chair": ch})
 	return out
 
@@ -396,9 +549,15 @@ func _spawn_customer() -> void:
 	else:
 		a = make_actor(customer_sheets[randi() % customer_sheets.size()], 2, DOOR)
 	a.speed = 36.0
-	var c := {"actor": a, "chair": chair, "table": pick["table"], "state": "walking", "patience": 45.0, "max_patience": 45.0}
+	var c := {"actor": a, "chair": chair, "table": pick["table"], "state": "walking",
+		"patience": 45.0, "max_patience": 45.0, "satisfaction": 1.0}
 	customers.append(c)
 	_customer_flow(c)
+
+
+func _plate_pos(c: Dictionary) -> Vector2:
+	var side := -9.0 if c["chair"]["dir"] == Actor.Dir.SE else 9.0
+	return tile_pos(c["table"]["tile"]) + Vector2(side, -24)
 
 
 func _customer_flow(c: Dictionary) -> void:
@@ -417,34 +576,62 @@ func _customer_flow(c: Dictionary) -> void:
 	while c["state"] == "waiting":
 		await get_tree().process_frame
 	a.bubble.visible = false
+	var plate: Sprite2D = null
 	if c["state"] == "served":
-		var plate := Sprite2D.new()
+		var tier: String = c["tier"]
+		plate = Sprite2D.new()
 		plate.texture = tex("res://assets/food/tiny/%s.png" % food)
-		plate.position = tile_pos(c["table"]["tile"]) + Vector2(0, -22)
+		plate.position = _plate_pos(c)
 		plate.z_index = 5
 		fx.add_child(plate)
-		await get_tree().create_timer(5.0).timeout
-		plate.queue_free()
-		var price: int = GS.FOODS[food]["price"]
-		var tip := int(round(price * GS.stat(c["server"], "charm")))
-		GS.add_coins(price + tip)
-		GS.served_total += 1
-		GS.add_rep(1)
-		_float_text(a.position + Vector2(0, -70), "+%d" % (price + tip), Color("ffd86b"))
-		if randf() < 0.08:
-			GS.gems += 10
-			GS.changed.emit()
-			_float_text(a.position + Vector2(0, -84), "+10 gems", Color("f08bd8"))
+		var badge := _star(tier)
+		badge.position = Vector2(0, -16)
+		plate.add_child(badge)
+		await get_tree().create_timer(2.0 if tier == "black" else 5.0).timeout
+		badge.queue_free()
+		_pay(c, food, tier)
 	else:
 		_float_text(a.position + Vector2(0, -70), "Too slow...", Color("ff8a8a"))
 	a.position += Vector2(0, 3)
 	c["chair"]["taken"] = false
+	if plate:  # leftovers stay until someone cleans the seat
+		plate.modulate = Color(0.55, 0.5, 0.5, 0.9)
+		c["chair"]["dirty"] = true
+		c["chair"]["plate"] = plate
 	await walk(a, DOOR)
 	var tw := create_tween()
 	tw.tween_property(a, "modulate:a", 0.0, 0.4)
 	await tw.finished
 	customers.erase(c)
 	a.queue_free()
+
+
+## Price x star tier, plus tips from the server's HOS (and the barista's HOS on drinks).
+func _pay(c: Dictionary, food: String, tier: String) -> void:
+	var a: Actor = c["actor"]
+	var price: int = GS.FOODS[food]["price"]
+	var sat: float = c.get("satisfaction", 1.0)
+	var tip_rate := GS.stat(c["server"], "hos") * 0.012
+	if food in GS.DRINKS and GS.staff.has(c["maker"]) and _role(c["maker"]) == "Barista":
+		tip_rate += GS.stat(c["maker"], "hos") * 0.006
+	var earned := int(round(price * GS.TIER_PRICE[tier] + (0.0 if tier == "black" else price * tip_rate * sat)))
+	GS.add_coins(earned)
+	GS.served_total += 1
+	GS.add_rep(int(round(GS.TIER_REP[tier] * sat)))
+	var col: Color = {"black": Color("9a9aa8"), "plain": Color("fff6ea"), "bronze": Color("e8a46a"),
+		"silver": Color("dfe6f2"), "gold": Color("ffd86b"), "diamond": Color("9ee8ff")}[tier]
+	var msg := "+%d %s" % [earned, GS.TIER_NAME[tier]]
+	if tier == "black":
+		msg = "+%d  Burnt..." % earned
+	_float_text(a.position + Vector2(0, -70), msg, col)
+	if tier == "diamond" and randf() < 0.5:
+		GS.gems += 5
+		GS.changed.emit()
+		_float_text(a.position + Vector2(0, -84), "+5 gems", Color("f08bd8"))
+	elif randf() < 0.05:
+		GS.gems += 10
+		GS.changed.emit()
+		_float_text(a.position + Vector2(0, -84), "+10 gems", Color("f08bd8"))
 
 
 func _process(delta: float) -> void:
@@ -459,6 +646,7 @@ func _process(delta: float) -> void:
 			c["actor"].bubble.set_progress(p, Color("6cc46a") if p > 0.35 else Color("e05a5a"))
 			if c["patience"] <= 0.0:
 				c["state"] = "angry"
+	_tick_stamina(delta)
 	save_t += delta
 	if save_t > 15.0:
 		save_t = 0.0
@@ -666,6 +854,15 @@ func _small_label(text: String, size: int = 10) -> Label:
 # ---- menu
 func _open_menu() -> void:
 	var list := _scroll(_open_panel("Menu"))
+	var legend := HBoxContainer.new()
+	legend.add_theme_constant_override("separation", 3)
+	for tier in GS.TIERS:
+		var tr := TextureRect.new()
+		tr.texture = tex("res://assets/ui/star_%s.png" % tier)
+		tr.stretch_mode = TextureRect.STRETCH_KEEP_CENTERED
+		legend.add_child(tr)
+		legend.add_child(_small_label("%s x%.1f " % [GS.TIER_NAME[tier], GS.TIER_PRICE[tier]], 9))
+	list.add_child(legend)
 	var grid := GridContainer.new()
 	grid.columns = 2
 	grid.add_theme_constant_override("h_separation", 8)
@@ -715,8 +912,8 @@ func _portrait(key: String) -> TextureRect:
 
 
 func _open_staff() -> void:
-	var list := _scroll(_open_panel("Staff"))
-	var roles := ["Chef", "Waiter", "Rest"]
+	var list := _scroll(_open_panel("Staff", Vector2(460, 300)))
+	list.add_child(_small_label("Chef TEC+FOC   Barista TEC+HOS   Waiter AGI+HOS   Hostess HOS+FOC   Cleaner AGI+END", 9))
 	for key in GS.staff:
 		var d: Dictionary = GS.STAFF[key]
 		var row := PanelContainer.new()
@@ -727,20 +924,50 @@ func _open_staff() -> void:
 		hb.add_child(_portrait(key))
 		var info := VBoxContainer.new()
 		info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		info.add_theme_constant_override("separation", 1)
+		info.add_theme_constant_override("separation", 2)
 		info.add_child(_small_label("%s  [%s]  Lv %d" % [d["name"], d["rarity"], GS.staff[key]["level"]], 12))
 		info.add_child(_small_label(d["title"], 10))
-		info.add_child(_small_label("Cook x%.2f   Speed x%.2f   Tips %d%%" % [GS.stat(key, "cook"), GS.stat(key, "serve"), int(GS.stat(key, "charm") * 100)], 9))
+		var stats_row := HBoxContainer.new()
+		stats_row.add_theme_constant_override("separation", 6)
+		info.add_child(stats_row)
+		_fill_stats(stats_row, key)
+		var st := HBoxContainer.new()
+		st.add_child(_small_label("Stamina", 9))
+		var bar := ProgressBar.new()
+		bar.custom_minimum_size = Vector2(120, 6)
+		bar.show_percentage = false
+		bar.max_value = GS.max_stamina(key)
+		bar.value = stamina.get(key, bar.max_value)
+		bar.add_theme_stylebox_override("fill", _sb(Color("8fd0f0") if not is_tired(key) else Color("b8b8e0"), Color("3b2a33"), 0, 0))
+		bar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		st.add_child(bar)
+		if is_tired(key):
+			st.add_child(_small_label(" tired - resting", 9))
+		info.add_child(st)
 		hb.add_child(info)
 		var ob := OptionButton.new()
-		for r in roles:
+		for r in GS.JOBS:
 			ob.add_item(r)
-		ob.selected = roles.find(GS.staff[key]["role"])
+		ob.selected = GS.JOBS.find(GS.staff[key]["role"])
+		ob.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		ob.item_selected.connect(func(i: int):
-			GS.staff[key]["role"] = roles[i]
-			GS.save_game())
+			GS.staff[key]["role"] = GS.JOBS[i]
+			GS.save_game()
+			_fill_stats(stats_row, key))
 		hb.add_child(ob)
 		list.add_child(row)
+
+
+## Five stat values; the two that drive the current job are highlighted.
+func _fill_stats(box: HBoxContainer, key: String) -> void:
+	for ch in box.get_children():
+		ch.queue_free()
+	var main_stats: Array = GS.JOB_STATS[GS.staff[key]["role"]]
+	for s in GS.STATS:
+		var l := _small_label("%s %d" % [GS.STAT_LABEL[s], int(round(GS.stat(key, s)))], 10)
+		if s in main_stats:
+			l.add_theme_color_override("font_color", C_PINK_DK)
+		box.add_child(l)
 
 
 # ---- summon
