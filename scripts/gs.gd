@@ -122,6 +122,8 @@ const SHIP_CABIN := [0, 0, 8, 4]     ## [c, r, width, height] indoor café room 
 ## Cabin front-row tiles whose outer (lower-left) wall is an open doorway.
 const SHIP_CABIN_DOORS := [[4, 3], [5, 3]]
 const SHIP_GANGWAY := [6, 5]         ## deck tile where customers come aboard
+## Deck sizes the Home Isle Shipyard can build (cols x rows), size 1..5.
+const SHIP_SIZES := [[12, 6], [14, 6], [14, 7], [16, 7], [16, 8]]
 
 ## ---- shared progression (one source of truth for café AND battle) ----
 const MAX_LEVEL := 30
@@ -800,9 +802,48 @@ func unlock_food(key: String) -> bool:
 
 
 ## Starting café. `tables` (2-4) keeps tables bought in pre-layout saves.
+func ship_deck_rows(cols: int, rows: int) -> Array:
+	var out: Array = []
+	for r in rows:
+		out.append("X".repeat(cols))
+	return out
+
+
+func expand_cost(to_size: int) -> Dictionary:
+	return {"coins": int(1500 * pow(to_size, 1.6)), "mats": 12 * to_size}
+
+
+func expand_block() -> String:
+	var lv := int(ship.get("size", 1))
+	if lv >= SHIP_SIZES.size():
+		return "Max size."
+	var c := expand_cost(lv + 1)
+	if coins < int(c["coins"]) or mats() < int(c["mats"]):
+		return "Needs %d coins and %d Building Materials." % [c["coins"], c["mats"]]
+	return ""
+
+
+## Shipyard: a longer/wider deck. Furniture keeps its place; the gangway
+## stays on the front row.
+func expand_ship() -> bool:
+	if expand_block() != "":
+		return false
+	var lv := int(ship.get("size", 1)) + 1
+	var c := expand_cost(lv)
+	coins -= int(c["coins"])
+	materials["build_mats"] = mats() - int(c["mats"])
+	var dims: Array = SHIP_SIZES[lv - 1]
+	ship["size"] = lv
+	ship["deck"] = ship_deck_rows(int(dims[0]), int(dims[1]))
+	ship["gangway"] = [int(ship["gangway"][0]), int(dims[1]) - 1]
+	changed.emit()
+	save_game()
+	return true
+
+
 func default_ship() -> Dictionary:
 	return {"deck": SHIP_TEMPLATE.duplicate(), "cabin": SHIP_CABIN.duplicate(), "gangway": SHIP_GANGWAY.duplicate(),
-		"doors": SHIP_CABIN_DOORS.duplicate(true)}
+		"doors": SHIP_CABIN_DOORS.duplicate(true), "size": 1}
 
 
 ## Starting café on the ship. Kitchen + one table in the cabin, `tables`

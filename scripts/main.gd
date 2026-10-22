@@ -83,6 +83,13 @@ var customer_sheets: Array[Texture2D] = []
 var theme_ui: Theme
 var kit := {}                   # ship-kit piece anchors (assets/ship/kit.json)
 
+# Home Isle
+var island_root: Node2D
+var isle_props: Node2D
+var shipyard_tiles: Array = []
+var pump_tile := Vector2i(-99, -99)
+var press_pos := Vector2.ZERO
+
 # voyages
 var voyage: VoyageManager
 var clouds: CloudNode
@@ -121,6 +128,7 @@ func _ready() -> void:
 	sky.add_child(BgNode.new())
 	clouds = CloudNode.new()
 	sky.add_child(clouds)
+	_build_island()
 	ship_root = Node2D.new()
 	add_child(ship_root)
 	camera = Camera2D.new()
@@ -215,6 +223,17 @@ func _ready() -> void:
 		else:
 			var rt: Dictionary = ShipStats.ROUTES[1]
 			_depart(rt, int(ShipStats.fuel_estimate(int(rt["segments"]))["fuel"]))
+	if "--demo-expand" in args and int(GS.ship.get("size", 1)) == 1:  # test: buy size 2, then reload
+		GS.coins += 20000
+		GS.add_material("build_mats", 40)
+		GS.expand_ship()
+		get_tree().reload_current_scene.call_deferred()
+		return
+	if "--demo-shipyard" in args:
+		await get_tree().create_timer(1.0).timeout
+		_open_shipyard()
+	if "--demo-isle" in args:  # look at the island
+		camera.position = tile_pos(_isle_origin() + _isle_size() / 2) + Vector2(40, -60)
 	if "--demo-ship" in args:
 		await get_tree().create_timer(1.0).timeout
 		_open_ship()
@@ -2149,35 +2168,7 @@ func _open_ship() -> void:
 		row.add_child(_small_label("score %.1f%s -> %s" % [perf, ml, bonus], 9))
 		list.add_child(row)
 
-	# upgrades
-	list.add_child(_small_label("Upgrades", 10))
-	for id in ShipStats.data.upgrades:
-		var u: Dictionary = ShipStats.data.upgrades[id]
-		var lv := ShipStats.level(id)
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 6)
-		var cost_text := ""
-		if lv < ShipStats.data.max_upgrade:
-			var c := ShipStats.data.upgrade_cost(lv + 1)
-			cost_text = "  (Lv%d: %d coins, %d mats)" % [lv + 1, c["coins"], c["mats"]]
-		var l := _small_label("%s Lv%d - %s%s" % [u["name"], lv, u["desc"], cost_text], 9)
-		l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		row.add_child(l)
-		var b := Button.new()
-		b.add_theme_font_size_override("font_size", 9)
-		if lv >= ShipStats.data.max_upgrade:
-			b.text = "Max"
-			b.disabled = true
-		else:
-			b.text = "Upgrade"
-			b.disabled = GS.ship_upgrade_block(id) != ""
-			b.tooltip_text = GS.ship_upgrade_block(id)
-		b.pressed.connect(func():
-			if GS.upgrade_ship(id):
-				_toast("%s upgraded!" % u["name"])
-			_open_ship())
-		row.add_child(b)
-		list.add_child(row)
+	list.add_child(_small_label("Upgrades, repairs and a bigger ship: visit the Shipyard on Home Isle (next to the pier).", 9))
 
 	# supplies at the anchorage
 	list.add_child(_small_label("Anchorage supplies  (Building Materials: %d, Aether Shards: %d)" % [
@@ -2208,18 +2199,6 @@ func _open_ship() -> void:
 			_toast("Refined %d Aether Fuel." % made)
 		_open_ship())
 	sup.add_child(rb)
-	var missing := int(ceil(ShipStats.stat("hull") - float(a["hull"])))
-	if missing > 0:
-		var rc := ShipStats.repair_cost(missing)
-		var hb := Button.new()
-		hb.text = "Repair hull (%d coins, %d mats)" % [rc["coins"], rc["mats"]]
-		hb.add_theme_font_size_override("font_size", 9)
-		hb.disabled = GS.coins < rc["coins"] or GS.mats() < rc["mats"]
-		hb.pressed.connect(func():
-			if GS.repair_hull():
-				_toast("Hull repaired.")
-			_open_ship())
-		sup.add_child(hb)
 	if float(a["engine"]) < 100.0:
 		var mb := Button.new()
 		mb.text = "Maintain engine (%d coins)" % ShipStats.maintain_cost()
@@ -2242,6 +2221,252 @@ func _open_ship() -> void:
 				GS.save_game()
 			_open_ship())
 		sup.add_child(bm)
+
+
+# ------------------------------------------------------------------ Home Isle
+## The island the ship docks at, built tile by tile on the ship's grid just
+## past the gangway: ground tiles, cliff sides from its outline, a pier, and
+## fixed buildings (not editable). Click the Shipyard or the fuel pump.
+func _isle_origin() -> Vector2i:
+	return Vector2i(2, ROWS + 2)   # top corner of the land patch (pier spans the gap)
+
+
+func _isle_size() -> Vector2i:
+	return Vector2i(8, 6)
+
+
+func _isle_has(t: Vector2i) -> bool:
+	return Rect2i(_isle_origin(), _isle_size()).has_point(t)
+
+
+func _isle_piece(name: String) -> Texture2D:
+	return tex("res://assets/island/%s.png" % name)
+
+
+## Put a ground tile so its top diamond is centred on the tile.
+func _isle_ground(name: String, t: Vector2i, z: int) -> void:
+	var tx := _isle_piece(name)
+	if tx == null:
+		return
+	var s := Sprite2D.new()
+	s.texture = tx
+	s.centered = false
+	var c: Array = kit[name]["centre"]
+	s.position = (tile_pos(t) - Vector2(c[0], c[1])).round()
+	s.z_index = z
+	island_root.add_child(s)
+
+
+## Place a prop with its base on a point (y-sorted inside the island).
+func _isle_prop(name: String, at: Vector2, foot := 6.0, flip := false) -> Sprite2D:
+	var tx := _isle_piece(name)
+	if tx == null:
+		return null
+	var s := Sprite2D.new()
+	s.texture = tx
+	s.centered = false
+	s.flip_h = flip
+	s.offset = Vector2(-tx.get_width() / 2.0, -tx.get_height() + foot).round()
+	s.position = at.round()
+	isle_props.add_child(s)
+	return s
+
+
+func _build_island() -> void:
+	island_root = Node2D.new()
+	add_child(island_root)
+	isle_props = Node2D.new()
+	isle_props.y_sort_enabled = true
+	island_root.add_child(isle_props)
+	for path in ["res://assets/island/island.json"]:
+		var f := FileAccess.open(path, FileAccess.READ)
+		if f:
+			kit.merge(JSON.parse_string(f.get_as_text()), true)
+	var o := _isle_origin()
+	var sz := _isle_size()
+	var path_tiles := {}
+	for t in [Vector2i(DOOR.x, o.y), Vector2i(DOOR.x, o.y + 1), Vector2i(DOOR.x, o.y + 2),
+			Vector2i(DOOR.x - 1, o.y + 2), Vector2i(DOOR.x - 1, o.y + 3), Vector2i(DOOR.x - 2, o.y + 3),
+			Vector2i(DOOR.x - 3, o.y + 3)]:
+		path_tiles[t] = true
+	# cliffs: lower-left and lower-right faces in 2-tile sections, then a narrower belly row
+	var cliff := ["cliff_a", "cliff_roots", "cliff_crystal", "cliff_roots"]
+	var last_r := o.y + sz.y - 1
+	var last_c := o.x + sz.x - 1
+	var drop := Vector2(0, 34)
+	for i in range(0, sz.x - 1, 2):
+		var c := o.x + i
+		var a := tile_pos(Vector2i(c, last_r)) + Vector2(-HW, 0)
+		var b := tile_pos(Vector2i(c + 1, last_r)) + Vector2(0, HH)
+		_isle_edge(cliff[(i / 2) % cliff.size()], a, b, -12)
+		if i >= 2 and i <= sz.x - 4:
+			_isle_edge(cliff[(i / 2 + 1) % cliff.size()], a + drop, b + drop, -13)
+	for i in range(0, sz.y - 1, 2):
+		var r := o.y + i
+		var a := tile_pos(Vector2i(last_c, r)) + Vector2(HW, 0)
+		var b := tile_pos(Vector2i(last_c, r + 1)) + Vector2(0, HH)
+		_isle_edge(cliff[(i / 2 + 2) % cliff.size()], a, b, -12)
+		if i >= 2 and i <= sz.y - 4:
+			_isle_edge("cliff_a", a + drop, b + drop, -13)
+	var tip := _isle_prop("tip", tile_pos(Vector2i(last_c, last_r)) + Vector2(0, HH + 70), 0)
+	if tip:
+		tip.reparent(island_root)
+		tip.z_index = -14
+	# ground, back to front
+	var tiles: Array = []
+	for r in range(o.y, o.y + sz.y):
+		for c in range(o.x, o.x + sz.x):
+			tiles.append(Vector2i(c, r))
+	tiles.sort_custom(func(p, q): return p.x + p.y < q.x + q.y)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 5
+	for t in tiles:
+		var g := "path" if path_tiles.has(t) else ("grass_flowers" if rng.randf() < 0.25 else "grass")
+		_isle_ground(g, t, -10)
+	# pier from the gangway down to the island
+	for r in range(ROWS, o.y):
+		_isle_ground("pier", Vector2i(DOOR.x, r), -9)
+		var p := tile_pos(Vector2i(DOOR.x, r))
+		for side in [Vector2(-HW + 4, 0), Vector2(0, HH - 2)]:
+			var post := _isle_prop("pier_post", p + side + Vector2(0, 26), 0)
+			if post:
+				post.reparent(island_root)
+				post.z_index = -11
+	# buildings (fixed) and decoration
+	shipyard_tiles = [Vector2i(o.x + 1, o.y + 1), Vector2i(o.x + 2, o.y + 1), Vector2i(o.x + 1, o.y + 2), Vector2i(o.x + 2, o.y + 2)]
+	_isle_prop("shipyard", tile_pos(Vector2i(o.x + 2, o.y + 2)) + Vector2(0, HH), 8)
+	pump_tile = Vector2i(DOOR.x + 1, o.y)
+	_isle_prop("pump", tile_pos(pump_tile), 10)
+	_isle_prop("crane", tile_pos(Vector2i(last_c, o.y + 1)), 10)
+	_isle_prop("crates", tile_pos(Vector2i(last_c - 1, o.y + 2)), 8)
+	_isle_prop("lamp", tile_pos(Vector2i(DOOR.x + 1, o.y + 2)), 8)
+	_isle_prop("lamp", tile_pos(Vector2i(o.x, o.y + 3)), 8)
+	for t in [Vector2i(o.x, o.y), Vector2i(last_c, last_r - 1), Vector2i(o.x, last_r)]:
+		_isle_prop("tree", tile_pos(t), 8)
+	for t in [Vector2i(o.x + 3, o.y), Vector2i(o.x + 2, last_r), Vector2i(last_c - 1, last_r), Vector2i(o.x + 4, o.y + 4)]:
+		_isle_prop("bush", tile_pos(t), 8)
+	var sign := Label.new()
+	sign.text = "Shipyard"
+	sign.add_theme_color_override("font_color", Color("ffe08a"))
+	sign.add_theme_color_override("font_outline_color", Color("1c1428"))
+	sign.add_theme_constant_override("outline_size", 4)
+	sign.position = tile_pos(Vector2i(o.x + 2, o.y + 2)) + Vector2(-26, HH - 112)
+	sign.z_index = 40
+	island_root.add_child(sign)
+
+
+func _isle_edge(piece: String, a: Vector2, b: Vector2, z: int) -> void:
+	var t := _isle_piece(piece)
+	if t == null or not kit.has(piece):
+		return
+	var m: Array = kit[piece]["top"]
+	var s := Vector2(m[0][0], m[0][1])
+	var e := Vector2(m[1][0], m[1][1])
+	var sx := (b.x - a.x) / (e.x - s.x)
+	var k := (b.y - a.y - (e.y - s.y)) / (e.x - s.x)
+	var spr := Sprite2D.new()
+	spr.texture = t
+	spr.centered = false
+	spr.transform = Transform2D(Vector2(sx, k), Vector2(0, 1), a - Vector2(sx * s.x, s.y + k * s.x))
+	spr.z_index = z
+	island_root.add_child(spr)
+
+
+## Click on the island (not while editing): Shipyard or fuel pump.
+func _isle_click() -> bool:
+	if voyage != null or editing or not island_root.visible:
+		return false
+	var t := pos_tile(island_root.get_local_mouse_position())
+	if t in shipyard_tiles or t == shipyard_tiles[0] + Vector2i(-1, -1):
+		_open_shipyard()
+		return true
+	if t == pump_tile:
+		_open_ship()
+		return true
+	return false
+
+
+# ---- Shipyard: upgrades, a bigger ship, repairs
+func _open_shipyard() -> void:
+	var v := _open_panel("Home Isle Shipyard", Vector2(470, 300))
+	var list := _scroll(v)
+	var lv := int(GS.ship.get("size", 1))
+	var dims: Array = GS.SHIP_SIZES[lv - 1]
+	list.add_child(_small_label("Your airship: %d x %d deck (size %d / %d)" % [dims[0], dims[1], lv, GS.SHIP_SIZES.size()], 10))
+	var row := HBoxContainer.new()
+	var expand_text := "Expand the ship - longer and wider deck, the hull is rebuilt around it."
+	if lv < GS.SHIP_SIZES.size():
+		var nc := GS.expand_cost(lv + 1)
+		var ndim: Array = GS.SHIP_SIZES[lv]
+		expand_text += "  (%dx%d: %d coins, %d mats)" % [ndim[0], ndim[1], nc["coins"], nc["mats"]]
+	var l := _small_label(expand_text, 9)
+	l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(l)
+	var eb := Button.new()
+	eb.add_theme_font_size_override("font_size", 9)
+	if lv >= GS.SHIP_SIZES.size():
+		eb.text = "Max size"
+		eb.disabled = true
+	else:
+		eb.text = "Expand"
+		eb.disabled = GS.expand_block() != ""
+		eb.tooltip_text = GS.expand_block()
+	eb.pressed.connect(func():
+		if GS.expand_ship():
+			_toast("The shipwrights extend your airship!")
+			get_tree().reload_current_scene())
+	row.add_child(eb)
+	list.add_child(row)
+
+	list.add_child(_small_label("Upgrades", 10))
+	for id in ShipStats.data.upgrades:
+		var u: Dictionary = ShipStats.data.upgrades[id]
+		var ulv := ShipStats.level(id)
+		var urow := HBoxContainer.new()
+		urow.add_theme_constant_override("separation", 6)
+		var cost_text := ""
+		if ulv < ShipStats.data.max_upgrade:
+			var c := ShipStats.data.upgrade_cost(ulv + 1)
+			cost_text = "  (Lv%d: %d coins, %d mats)" % [ulv + 1, c["coins"], c["mats"]]
+		var ul := _small_label("%s Lv%d - %s%s" % [u["name"], ulv, u["desc"], cost_text], 9)
+		ul.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		urow.add_child(ul)
+		var b := Button.new()
+		b.add_theme_font_size_override("font_size", 9)
+		b.text = "Max" if ulv >= ShipStats.data.max_upgrade else "Upgrade"
+		b.disabled = ulv >= ShipStats.data.max_upgrade or GS.ship_upgrade_block(id) != ""
+		b.tooltip_text = GS.ship_upgrade_block(id)
+		b.pressed.connect(func():
+			if GS.upgrade_ship(id):
+				_toast("%s upgraded!" % u["name"])
+			_open_shipyard())
+		urow.add_child(b)
+		list.add_child(urow)
+
+	var missing := int(ceil(ShipStats.stat("hull") - float(GS.airship["hull"])))
+	list.add_child(_small_label("Hull %d / %d" % [GS.airship["hull"], ShipStats.stat("hull")], 10))
+	if missing > 0:
+		var rc := ShipStats.repair_cost(missing)
+		var hb := Button.new()
+		hb.text = "Repair hull (%d coins, %d mats)" % [rc["coins"], rc["mats"]]
+		hb.add_theme_font_size_override("font_size", 9)
+		hb.disabled = GS.coins < rc["coins"] or GS.mats() < rc["mats"]
+		hb.pressed.connect(func():
+			if GS.repair_hull():
+				_toast("Hull repaired.")
+			_open_shipyard())
+		list.add_child(hb)
+	var bm := Button.new()
+	bm.text = "Buy 5 Building Materials (%d coins)  - you have %d" % [GS.MATS_PRICE * 5, GS.mats()]
+	bm.add_theme_font_size_override("font_size", 9)
+	bm.disabled = GS.coins < GS.MATS_PRICE * 5
+	bm.pressed.connect(func():
+		if GS.coins >= GS.MATS_PRICE * 5:
+			GS.coins -= GS.MATS_PRICE * 5
+			GS.add_material("build_mats", 5)
+			GS.save_game()
+		_open_shipyard())
+	list.add_child(bm)
 
 
 # ---- Sky Routes (voyages leave and return to the home anchorage)
@@ -2312,6 +2537,7 @@ func _depart(route: Dictionary, fuel_cost: int) -> void:
 	for ch in voyage_log_box.get_children():
 		ch.queue_free()
 	clouds.speed_mult = 8.0
+	create_tween().tween_property(island_root, "modulate:a", 0.0, 1.2)
 	voyage.start(route, fuel_cost)
 
 
@@ -2352,6 +2578,7 @@ func _voyage_done(report: Dictionary) -> void:
 		ch.queue_free()
 	night_bar.visible = phase == "night"
 	clouds.speed_mult = 1.0
+	create_tween().tween_property(island_root, "modulate:a", 1.0, 1.2)
 	var v := _open_panel("Voyage Report - %s" % report["route"]["name"], Vector2(340, 240))
 	v.add_child(_small_label(("Completed!" if report["completed"] else "Turned back after %d segments." % report["segments"]), 13))
 	v.add_child(_small_label("Fuel used %d    Hull -%d (now %d/%d)    Engine wear -%d%%" % [report["fuel"], report["hull_lost"],
@@ -2599,13 +2826,21 @@ func _update_ghost() -> void:
 ## drag when not editing), or WASD / arrow keys.
 func _move_camera(d: Vector2) -> void:
 	var c := _ship_center()
-	camera.position = (camera.position + d).clamp(c - Vector2(230, 170), c + Vector2(230, 90)).round()
+	var isle := tile_pos(_isle_origin() + _isle_size() / 2)
+	var lo := Vector2(minf(c.x - 230, isle.x - 120), c.y - 170)
+	var hi := Vector2(c.x + 230, maxf(c.y + 90, isle.y + 60))
+	camera.position = (camera.position + d).clamp(lo, hi).round()
 
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and event.keycode == KEY_H:
 		walls_see_through = not walls_see_through
 		_toast("Walls: " + ("see-through" if walls_see_through else "solid (fade when you point inside)"))
+	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and not overlay.visible and not editing:
+		if event.pressed:
+			press_pos = event.position
+		elif event.position.distance_to(press_pos) < 4.0 and _isle_click():
+			return
 	if event is InputEventMouseMotion and not overlay.visible:
 		var m: int = event.button_mask
 		if m & MOUSE_BUTTON_MASK_MIDDLE or (not editing and m & (MOUSE_BUTTON_MASK_LEFT | MOUSE_BUTTON_MASK_RIGHT)):
