@@ -29,6 +29,7 @@ const C_PINK := Color("e98b9c")
 const C_PINK_DK := Color("b85d70")
 const RARITY_COL := {"R": Color("aab4c4"), "SR": Color("b07ce8"), "SSR": Color("f2c14e")}
 const NIGHT_TINT := Color(0.55, 0.56, 0.82)
+const SEAT_SLIDE := 0.35   # fraction of the chair->table step a seated customer moves in
 
 var astar := AStarGrid2D.new()
 var world: Node2D
@@ -812,6 +813,9 @@ func _customer_flow(c: Dictionary) -> void:
 	create_tween().tween_property(a, "modulate:a", 1.0, 0.4)
 	await walk(a, seat["tile"])
 	a.sit([Actor.Dir.SE, Actor.Dir.SW, Actor.Dir.NW, Actor.Dir.NE][seat["dir"]])
+	# the seat is the half of the chair tile nearest the table: slide in so the
+	# customer sits at the table (legs tucked under it) instead of beside it
+	a.position += (tile_pos(seat["table"]) - tile_pos(seat["tile"])) * SEAT_SLIDE
 	var menu: Array = GS.unlocked
 	var food: String = menu[randi() % menu.size()]
 	c["food"] = food
@@ -838,6 +842,7 @@ func _customer_flow(c: Dictionary) -> void:
 	else:
 		_float_text(a.position + Vector2(0, -70), "Too slow...", Color("ff8a8a"))
 	a.stand()
+	a.position = tile_pos(seat["tile"])
 	seat["taken"] = false
 	if plate:  # leftovers stay until someone buses the seat
 		plate.modulate = Color(0.55, 0.5, 0.5, 0.9)
